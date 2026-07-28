@@ -1,0 +1,74 @@
+"""Application entry point.
+
+Assembles the FastAPI app from all the pieces configured elsewhere:
+settings, logging, CORS, request logging, global exception handlers,
+and routers. No business logic and no route definitions live here —
+this file only wires things together.
+
+Run locally with:
+    uvicorn app.main:app --reload
+"""
+import logging
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.api.health import router as health_router
+from app.core.config import settings
+from app.core.logging import configure_logging
+from app.exceptions.handlers import register_exception_handlers
+from app.middleware.request_logging import RequestLoggingMiddleware
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Startup/shutdown hooks, using FastAPI's current lifespan API
+    (the ``@app.on_event`` decorators are deprecated).
+    """
+    logger.info(
+        "app_startup app_name=%s environment=%s debug=%s",
+        settings.APP_NAME,
+        settings.ENVIRONMENT,
+        settings.DEBUG,
+    )
+    yield
+    logger.info("app_shutdown")
+
+
+def create_app() -> FastAPI:
+    """Build and configure the FastAPI application instance.
+
+    Using a factory function (rather than a bare module-level ``app =
+    FastAPI()``) keeps app construction testable — tests can call
+    ``create_app()`` fresh with overridden dependencies instead of
+    sharing global state.
+    """
+    configure_logging()
+
+    app = FastAPI(
+        title=settings.APP_NAME,
+        debug=settings.DEBUG,
+        lifespan=lifespan,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.ALLOWED_ORIGINS_LIST,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    app.add_middleware(RequestLoggingMiddleware)
+
+    register_exception_handlers(app)
+
+    app.include_router(health_router)
+
+    return app
+
+
+app = create_app()

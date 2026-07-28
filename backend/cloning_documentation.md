@@ -1,0 +1,3 @@
+git clone ...
+cd backend
+uv sync
