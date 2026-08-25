@@ -83,3 +83,4 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+print("DATABASE URL USED:", settings.DATABASE_URL)

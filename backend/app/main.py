@@ -16,6 +16,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.health import router as health_router
+from app.api.bom import router as bom_router
+from app.api.stock import router as stock_router
+from app.api.simulation import router as simulation_router
 from app.core.config import settings
 from app.core.logging import configure_logging
 from app.exceptions.handlers import register_exception_handlers
@@ -66,7 +69,11 @@ def create_app() -> FastAPI:
 
     register_exception_handlers(app)
 
+    # Register API routers
     app.include_router(health_router)
+    app.include_router(bom_router)
+    app.include_router(stock_router)
+    app.include_router(simulation_router)
 
     return app
 
