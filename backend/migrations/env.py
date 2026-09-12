@@ -35,6 +35,8 @@ from app.models.login_event import LoginEvent
 from app.models.manufacturing_receiver import ManufacturingReceiver
 from app.models.material import Material
 from app.models.material_type import MaterialType
+from app.models.parsed_purchase_order import ParsedPurchaseOrder
+from app.models.parsed_purchase_order_correction import ParsedPurchaseOrderCorrection
 from app.models.po_status_history import POStatusHistory
 from app.models.project import Project
 from app.models.purchase_order import PurchaseOrder
@@ -42,6 +44,7 @@ from app.models.purchase_order_line import PurchaseOrderLine
 from app.models.purchase_order_version import PurchaseOrderVersion
 from app.models.purchase_order_version_change import PurchaseOrderVersionChange
 from app.models.simulation import Simulation
+from app.models.simulation_fgpn import SimulationFGPN
 from app.models.stock_allocation import StockAllocation
 from app.models.stock_issue_handover import StockIssueHandover
 from app.models.stock_unit import StockUnit

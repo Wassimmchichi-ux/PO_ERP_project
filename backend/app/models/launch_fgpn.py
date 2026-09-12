@@ -39,6 +39,12 @@ class LaunchFGPN(Base):
         nullable=False,
     )
     planned_quantity: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    delivered_quantity: Mapped[Decimal] = mapped_column(
+        Numeric(10, 4),
+        nullable=False,
+        server_default="0",
+    )
+    last_customer_delivery_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
     launch: Mapped["Launch"] = relationship("Launch", back_populates="launch_fgpns")

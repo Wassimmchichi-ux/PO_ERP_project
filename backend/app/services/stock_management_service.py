@@ -9,14 +9,16 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.exceptions.base import NotFoundException
+from app.exceptions.base import NotFoundException, ValidationException
 from app.repositories import stock_repository
 from app.schemas.stock import (
     StockSummaryItem,
     ProductionStockItem,
     InTransitItem,
     MaterialStockDetailResponse,
-    StockDashboardStats
+    StockDashboardStats,
+    StockUnitReceptionRequest,
+    StockUnitReceptionResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,7 +115,10 @@ def _build_in_transit_item(su, material, mtype) -> InTransitItem:
         quantity=su.quantity,
         expected_arrival_date=su.expected_arrival_date.date() if su.expected_arrival_date else None,
         days_until_arrival=days,
-        status="DELAYED" if days is not None and days < 0 else "ON_TIME"
+        status="DELAYED" if days is not None and days < 0 else "ON_TIME",
+        assigned_user_id=su.user_id,
+        assigned_user_name=su.user.full_name if su.user else None,
+        assigned_user_role=su.user.role if su.user else None,
     )
 
 
@@ -199,3 +204,50 @@ def confirm_production_handover(db: Session, stock_unit_id: int, handover_docume
 
     db.commit()
     return get_material_stock_detail(db, stock_unit.material_part_number)
+
+
+def record_stock_unit_reception(
+    db: Session,
+    request: StockUnitReceptionRequest,
+    reception_user_id,
+) -> StockUnitReceptionResponse:
+    """Record a warehouse/in-transit stock unit and optional launch owner."""
+    if request.status not in {"WAREHOUSE", "IN_TRANSIT"}:
+        raise ValidationException("Stock reception status must be WAREHOUSE or IN_TRANSIT.")
+    if request.status == "IN_TRANSIT" and request.expected_arrival_date is None:
+        raise ValidationException("expected_arrival_date is required for IN_TRANSIT stock.")
+
+    if stock_repository.get_material_with_type(db, request.material_part_number) is None:
+        raise NotFoundException(f"Material {request.material_part_number} not found.")
+
+    assigned_user = None
+    if request.assigned_user_id is not None:
+        assigned_user = stock_repository.get_user(db, request.assigned_user_id)
+        if assigned_user is None:
+            raise NotFoundException(f"Assigned user {request.assigned_user_id} not found.")
+        if not stock_repository.is_affectable_stock_owner(assigned_user):
+            raise ValidationException("Stock can only be affected to a launch engineer or launch manager.")
+
+    stock_unit = stock_repository.create_stock_unit_reception(
+        db,
+        material_part_number=request.material_part_number,
+        quantity=request.quantity,
+        status=request.status,
+        expected_arrival_date=request.expected_arrival_date,
+        assigned_user_id=request.assigned_user_id,
+        reception_user_id=reception_user_id,
+    )
+    db.commit()
+    db.refresh(stock_unit)
+
+    return StockUnitReceptionResponse(
+        stock_unit_id=stock_unit.stock_unit_id,
+        material_part_number=stock_unit.material_part_number,
+        quantity=stock_unit.quantity,
+        status=stock_unit.status,
+        expected_arrival_date=stock_unit.expected_arrival_date,
+        assigned_user_id=stock_unit.user_id,
+        assigned_user_name=assigned_user.full_name if assigned_user else None,
+        assigned_user_role=assigned_user.role if assigned_user else None,
+        created_at=stock_unit.created_at,
+    )

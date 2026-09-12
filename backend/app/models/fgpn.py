@@ -5,7 +5,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, ForeignKey, Identity, Integer, Numeric, String
+from sqlalchemy import DateTime, ForeignKey, Identity, Index, Integer, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 
 class FGPN(Base):
     __tablename__ = "FGPN"
+    __table_args__ = (
+        Index("FGPN_project_id_fgpn_code_idx", "project_id", "fgpn_code", unique=True),
+    )
 
     fgpn_id: Mapped[int] = mapped_column(
         Integer,
@@ -32,7 +35,7 @@ class FGPN(Base):
         nullable=False,
     )
     fgpn_code: Mapped[str] = mapped_column(
-        String(150),
+        String(50),
         nullable=False,
     )
     description: Mapped[str | None] = mapped_column(
@@ -48,9 +51,10 @@ class FGPN(Base):
         nullable=False,
     )
     status: Mapped[str] = mapped_column(
-        String(20),
+        String(50),
         nullable=False,
         server_default="Active",
+        comment="Active, Inactive",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime,

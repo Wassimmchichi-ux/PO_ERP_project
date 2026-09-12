@@ -1,10 +1,10 @@
-from typing import Optional
+from typing import Any, Optional
 import datetime
 import decimal
 import enum
 import uuid
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKeyConstraint, Identity, Index, Integer, Numeric, PrimaryKeyConstraint, String, Text, UniqueConstraint, Uuid, text
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKeyConstraint, Identity, Index, Integer, JSON, Numeric, PrimaryKeyConstraint, String, Text, UniqueConstraint, Uuid, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 # Import all model files so Alembic sees every table
 
@@ -110,7 +110,7 @@ class PurchaseOrder(Base):
     po_number: Mapped[str] = mapped_column(String(10), nullable=False)
     customer_id: Mapped[int] = mapped_column(Integer, nullable=False)
     contact_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    current_version_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    current_version_id: Mapped[Optional[int]] = mapped_column(Integer)
     current_status: Mapped[str] = mapped_column(String(30), nullable=False, comment='Unplanned, In Progress, Done, Packaged, Delivered')
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False)
@@ -182,7 +182,8 @@ class User(Base):
     login_events: Mapped[list['LoginEvents']] = relationship('LoginEvents', back_populates='user')
     CorrectionEvent: Mapped[list['CorrectionEvent']] = relationship('CorrectionEvent', back_populates='user')
     POStatusHistory: Mapped[list['POStatusHistory']] = relationship('POStatusHistory', back_populates='user')
-    Simulation: Mapped[list['Simulation']] = relationship('Simulation', back_populates='user')
+    Simulation: Mapped[list['Simulation']] = relationship('Simulation', foreign_keys='[Simulation.created_by]', back_populates='user')
+    Simulation_stock_owner: Mapped[list['Simulation']] = relationship('Simulation', foreign_keys='[Simulation.stock_owner_user_id]', back_populates='stock_owner')
     BOM: Mapped[list['BOM']] = relationship('BOM', back_populates='user')
     FGPNPriceHistory: Mapped[list['FGPNPriceHistory']] = relationship('FGPNPriceHistory', back_populates='user')
     Launch_completed_by: Mapped[list['Launch']] = relationship('Launch', foreign_keys='[Launch.completed_by]', back_populates='completed_by_user')
@@ -362,11 +363,61 @@ class CorrectionEvent(Base):
     user: Mapped['User'] = relationship('User', back_populates='CorrectionEvent')
 
 
+class ParsedPurchaseOrder(Base):
+    __tablename__ = 'ParsedPurchaseOrder'
+    __table_args__ = (
+        ForeignKeyConstraint(['created_by'], ['users.id'], deferrable=True, name='ParsedPurchaseOrder_created_by_fkey'),
+        ForeignKeyConstraint(['document_id'], ['Document.document_id'], deferrable=True, name='ParsedPurchaseOrder_document_id_fkey'),
+        ForeignKeyConstraint(['validated_po_id'], ['PurchaseOrder.po_id'], deferrable=True, name='ParsedPurchaseOrder_validated_po_id_fkey'),
+        PrimaryKeyConstraint('parsed_po_id', name='ParsedPurchaseOrder_pkey')
+    )
+
+    parsed_po_id: Mapped[int] = mapped_column(Integer, Identity(start=1, increment=1, minvalue=1, maxvalue=2147483647, cycle=False, cache=1), primary_key=True, autoincrement=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("'PARSED'::character varying"), comment='PARSED, CORRECTED, VALIDATED, IMPORTED, REJECTED')
+    parsed_payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_by: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    created_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False)
+    document_id: Mapped[Optional[int]] = mapped_column(Integer)
+    source_file_name: Mapped[Optional[str]] = mapped_column(String(255))
+    parser_name: Mapped[Optional[str]] = mapped_column(String(100))
+    parser_version: Mapped[Optional[str]] = mapped_column(String(50))
+    validated_po_id: Mapped[Optional[int]] = mapped_column(Integer)
+
+    document: Mapped[Optional['Document']] = relationship('Document')
+    creator: Mapped['User'] = relationship('User')
+    validated_purchase_order: Mapped[Optional['PurchaseOrder']] = relationship('PurchaseOrder')
+    corrections: Mapped[list['ParsedPurchaseOrderCorrection']] = relationship('ParsedPurchaseOrderCorrection', back_populates='parsed_purchase_order')
+
+
+class ParsedPurchaseOrderCorrection(Base):
+    __tablename__ = 'ParsedPurchaseOrderCorrection'
+    __table_args__ = (
+        ForeignKeyConstraint(['corrected_by'], ['users.id'], deferrable=True, name='ParsedPurchaseOrderCorrection_corrected_by_fkey'),
+        ForeignKeyConstraint(['parsed_po_id'], ['ParsedPurchaseOrder.parsed_po_id'], deferrable=True, name='ParsedPurchaseOrderCorrection_parsed_po_id_fkey'),
+        PrimaryKeyConstraint('correction_id', name='ParsedPurchaseOrderCorrection_pkey'),
+        Index('ParsedPurchaseOrderCorrection_parsed_po_id_field_path_idx', 'parsed_po_id', 'field_path', unique=True)
+    )
+
+    correction_id: Mapped[int] = mapped_column(Integer, Identity(start=1, increment=1, minvalue=1, maxvalue=2147483647, cycle=False, cache=1), primary_key=True, autoincrement=True)
+    parsed_po_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    field_path: Mapped[str] = mapped_column(String(255), nullable=False, comment='Header field or nested path like lines[0].quantity')
+    confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text('true'))
+    corrected_by: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    corrected_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False)
+    original_value: Mapped[Optional[Any]] = mapped_column(JSON)
+    corrected_value: Mapped[Optional[Any]] = mapped_column(JSON)
+
+    parsed_purchase_order: Mapped['ParsedPurchaseOrder'] = relationship('ParsedPurchaseOrder', back_populates='corrections')
+    corrector: Mapped['User'] = relationship('User')
+
+
 class FGPN(Base):
     __tablename__ = 'FGPN'
     __table_args__ = (
         ForeignKeyConstraint(['project_id'], ['Project.project_id'], deferrable=True, name='FGPN_project_id_fkey'),
-        PrimaryKeyConstraint('fgpn_id', name='FGPN_pkey')
+        PrimaryKeyConstraint('fgpn_id', name='FGPN_pkey'),
+        Index('FGPN_project_id_fgpn_code_idx', 'project_id', 'fgpn_code', unique=True)
     )
 
     fgpn_id: Mapped[int] = mapped_column(Integer, Identity(start=1, increment=1, minvalue=1, maxvalue=2147483647, cycle=False, cache=1), primary_key=True, autoincrement=True)
@@ -414,13 +465,14 @@ class Simulation(Base):
     __table_args__ = (
         ForeignKeyConstraint(['created_by'], ['users.id'], deferrable=True, name='Simulation_created_by_fkey'),
         ForeignKeyConstraint(['mtg_minutes_document_id'], ['Document.document_id'], deferrable=True, name='Simulation_mtg_minutes_document_id_fkey'),
-        PrimaryKeyConstraint('simulation_id', name='Simulation_pkey'),
-        UniqueConstraint('launch_id', name='Simulation_launch_id_key')
+        ForeignKeyConstraint(['stock_owner_user_id'], ['users.id'], deferrable=True, name='Simulation_stock_owner_user_id_fkey'),
+        PrimaryKeyConstraint('simulation_id', name='Simulation_pkey')
     )
 
     simulation_id: Mapped[int] = mapped_column(Integer, Identity(start=1, increment=1, minvalue=1, maxvalue=2147483647, cycle=False, cache=1), primary_key=True, autoincrement=True)
-    launch_id: Mapped[int] = mapped_column(Integer, nullable=False)
     simulation_mode: Mapped[str] = mapped_column(String(30), nullable=False, comment='CURRENT_STOCK, INCLUDING_IN_TRANSIT')
+    stock_scope_mode: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("'ALL'::character varying"), comment='ALL, OWNED_ONLY')
+    include_global_stock: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text('false'), comment='When OWNED_ONLY, include global stock units with no affected owner.')
     target_date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
     safety_coefficient: Mapped[decimal.Decimal] = mapped_column(Numeric(5, 2), nullable=False, server_default=text('2'))
     is_feasible: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -428,8 +480,10 @@ class Simulation(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime, nullable=False)
     created_by: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
     shortfall_json: Mapped[Optional[str]] = mapped_column(Text)
+    stock_owner_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(Uuid)
 
-    user: Mapped['User'] = relationship('User', back_populates='Simulation')
+    user: Mapped['User'] = relationship('User', foreign_keys=[created_by], back_populates='Simulation')
+    stock_owner: Mapped[Optional['User']] = relationship('User', foreign_keys=[stock_owner_user_id], back_populates='Simulation_stock_owner')
     mtg_minutes_document: Mapped['Document'] = relationship('Document', back_populates='Simulation')
     StockAllocation: Mapped[list['StockAllocation']] = relationship('StockAllocation', back_populates='simulation')
     StockIssueHandover: Mapped[list['StockIssueHandover']] = relationship('StockIssueHandover', back_populates='simulation')
@@ -490,14 +544,16 @@ class Launch(Base):
     __table_args__ = (
         ForeignKeyConstraint(['completed_by'], ['users.id'], deferrable=True, name='Launch_completed_by_fkey'),
         ForeignKeyConstraint(['delivery_method_id'], ['DeliveryMethod.delivery_method_id'], deferrable=True, name='Launch_delivery_method_id_fkey'),
-        ForeignKeyConstraint(['launch_id'], ['Simulation.launch_id'], deferrable=True, name='Launch_launch_id_fkey'),
         ForeignKeyConstraint(['receiver_id'], ['ManufacturingReceiver.receiver_id'], deferrable=True, name='Launch_receiver_id_fkey'),
+        ForeignKeyConstraint(['simulation_id'], ['Simulation.simulation_id'], deferrable=True, name='Launch_simulation_id_fkey'),
         ForeignKeyConstraint(['verification_document_id'], ['Document.document_id'], deferrable=True, name='Launch_verification_document_id_fkey'),
         ForeignKeyConstraint(['verified_by'], ['users.id'], deferrable=True, name='Launch_verified_by_fkey'),
+        UniqueConstraint('simulation_id', name='Launch_simulation_id_key'),
         PrimaryKeyConstraint('launch_id', name='Launch_pkey')
     )
 
     launch_id: Mapped[int] = mapped_column(Integer, Identity(start=1, increment=1, minvalue=1, maxvalue=2147483647, cycle=False, cache=1), primary_key=True, autoincrement=True)
+    simulation_id: Mapped[int] = mapped_column(Integer, nullable=False)
     planned_date: Mapped[datetime.date] = mapped_column(Date, nullable=False)
     delivery_method_id: Mapped[int] = mapped_column(Integer, nullable=False)
     receiver_id: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -528,6 +584,7 @@ class PurchaseOrderLine(Base):
         ForeignKeyConstraint(['fgpn_id'], ['FGPN.fgpn_id'], deferrable=True, name='PurchaseOrderLine_fgpn_id_fkey'),
         ForeignKeyConstraint(['po_version_id'], ['PurchaseOrderVersion.po_version_id'], deferrable=True, name='PurchaseOrderLine_po_version_id_fkey'),
         PrimaryKeyConstraint('po_line_id', name='PurchaseOrderLine_pkey'),
+        Index('PurchaseOrderLine_po_version_id_fgpn_id_idx', 'po_version_id', 'fgpn_id', unique=True),
         Index('PurchaseOrderLine_po_version_id_line_number_idx', 'po_version_id', 'line_number', unique=True)
     )
 

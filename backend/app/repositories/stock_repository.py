@@ -1,20 +1,31 @@
 """Repository layer for Stock Management."""
 from __future__ import annotations
 
+import uuid
 from datetime import date, datetime
 from typing import Optional
 from decimal import Decimal
 
 from sqlalchemy import func, select, and_, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from app.models.stock_unit import StockUnit
 from app.models.cutting_consumption import CuttingConsumption
 from app.models.material import Material
 from app.models.material_type import MaterialType
+from app.models.user import User
 
 
-def get_warehouse_stock_by_material(db: Session) -> dict[str, Decimal]:
+_AFFECTABLE_STOCK_OWNER_ROLES = {"LAUNCH ENGINEER", "LAUNCH MANAGER"}
+
+
+def get_warehouse_stock_by_material(
+    db: Session,
+    *,
+    assigned_user_id: uuid.UUID | None = None,
+    assigned_only: bool = False,
+    include_global_stock: bool = False,
+) -> dict[str, Decimal]:
     """Returns total warehouse quantity per material_part_number."""
     stmt = (
         select(
@@ -22,13 +33,21 @@ def get_warehouse_stock_by_material(db: Session) -> dict[str, Decimal]:
             func.coalesce(func.sum(StockUnit.quantity), 0).label('total_qty')
         )
         .where(StockUnit.status == 'WAREHOUSE')
-        .group_by(StockUnit.material_part_number)
     )
+    if assigned_only:
+        stmt = _filter_by_stock_owner_scope(stmt, assigned_user_id, include_global_stock)
+    stmt = stmt.group_by(StockUnit.material_part_number)
     result = db.execute(stmt).all()
     return {row.material_part_number: row.total_qty for row in result}
 
 
-def get_production_stock_by_material(db: Session) -> dict[str, Decimal]:
+def get_production_stock_by_material(
+    db: Session,
+    *,
+    assigned_user_id: uuid.UUID | None = None,
+    assigned_only: bool = False,
+    include_global_stock: bool = False,
+) -> dict[str, Decimal]:
     """Returns production-received WIP quantity per material_part_number."""
     stmt = (
         select(
@@ -36,13 +55,21 @@ def get_production_stock_by_material(db: Session) -> dict[str, Decimal]:
             func.coalesce(func.sum(StockUnit.quantity), 0).label('total_qty')
         )
         .where(StockUnit.status == 'PRODUCTION')
-        .group_by(StockUnit.material_part_number)
     )
+    if assigned_only:
+        stmt = _filter_by_stock_owner_scope(stmt, assigned_user_id, include_global_stock)
+    stmt = stmt.group_by(StockUnit.material_part_number)
     result = db.execute(stmt).all()
     return {row.material_part_number: row.total_qty for row in result}
 
 
-def get_in_transit_stock_by_material(db: Session) -> dict[str, Decimal]:
+def get_in_transit_stock_by_material(
+    db: Session,
+    *,
+    assigned_user_id: uuid.UUID | None = None,
+    assigned_only: bool = False,
+    include_global_stock: bool = False,
+) -> dict[str, Decimal]:
     """Returns total in transit quantity per material_part_number."""
     stmt = (
         select(
@@ -50,8 +77,10 @@ def get_in_transit_stock_by_material(db: Session) -> dict[str, Decimal]:
             func.coalesce(func.sum(StockUnit.quantity), 0).label('total_qty')
         )
         .where(StockUnit.status == 'IN_TRANSIT')
-        .group_by(StockUnit.material_part_number)
     )
+    if assigned_only:
+        stmt = _filter_by_stock_owner_scope(stmt, assigned_user_id, include_global_stock)
+    stmt = stmt.group_by(StockUnit.material_part_number)
     result = db.execute(stmt).all()
     return {row.material_part_number: row.total_qty for row in result}
 
@@ -79,23 +108,82 @@ def get_all_materials(db: Session) -> list[tuple[Material, MaterialType]]:
     return db.execute(stmt).all()  # type: ignore
 
 
-def get_positive_stock_units_by_status(db: Session, status: str) -> list[StockUnit]:
+def get_positive_stock_units_by_status(
+    db: Session,
+    status: str,
+    *,
+    assigned_user_id: uuid.UUID | None = None,
+    assigned_only: bool = False,
+    include_global_stock: bool = False,
+) -> list[StockUnit]:
     """Get positive-quantity stock units for one stock status."""
     stmt = (
         select(StockUnit)
+        .options(joinedload(StockUnit.user))
         .where(StockUnit.status == status)
         .where(StockUnit.quantity > 0)
     )
+    if assigned_only:
+        stmt = _filter_by_stock_owner_scope(stmt, assigned_user_id, include_global_stock)
     return db.execute(stmt).scalars().all()
+
+
+def _filter_by_stock_owner_scope(stmt, assigned_user_id: uuid.UUID | None, include_global_stock: bool):
+    if include_global_stock:
+        return stmt.where(or_(StockUnit.user_id == assigned_user_id, StockUnit.user_id.is_(None)))
+    return stmt.where(StockUnit.user_id == assigned_user_id)
 
 
 def get_stock_units_by_ids(db: Session, stock_unit_ids: list[int]) -> dict[int, StockUnit]:
     """Get stock units keyed by id."""
     if not stock_unit_ids:
         return {}
-    stmt = select(StockUnit).where(StockUnit.stock_unit_id.in_(stock_unit_ids))
+    stmt = (
+        select(StockUnit)
+        .options(joinedload(StockUnit.user))
+        .where(StockUnit.stock_unit_id.in_(stock_unit_ids))
+    )
     units = db.execute(stmt).scalars().all()
     return {unit.stock_unit_id: unit for unit in units}
+
+
+def get_user(db: Session, user_id: uuid.UUID) -> User | None:
+    """Return a user by id."""
+    return db.get(User, user_id)
+
+
+def is_affectable_stock_owner(user: User) -> bool:
+    """Return whether stock can be affected to this user."""
+    role = str(user.role).replace("_", " ").upper()
+    return role in _AFFECTABLE_STOCK_OWNER_ROLES
+
+
+def create_stock_unit_reception(
+    db: Session,
+    *,
+    material_part_number: str,
+    quantity: Decimal,
+    status: str,
+    expected_arrival_date: datetime | None,
+    assigned_user_id: uuid.UUID | None,
+    reception_user_id: uuid.UUID | None,
+) -> StockUnit:
+    """Create a stock unit received or recorded by warehouse."""
+    now = datetime.now()
+    stock_unit = StockUnit(
+        material_part_number=material_part_number,
+        quantity=quantity,
+        status=status,
+        expected_arrival_date=expected_arrival_date,
+        reception_date=now,
+        reception_username=reception_user_id,
+        created_at=now,
+        updated_at=now,
+        user_id=assigned_user_id,
+    )
+    db.add(stock_unit)
+    db.flush()
+    return stock_unit
 
 
 def is_stock_unit_available_for_quantity(stock_unit: StockUnit, quantity: Decimal) -> bool:
@@ -198,6 +286,7 @@ def get_in_transit_stock_units(db: Session, from_date: Optional[date] = None, to
     """Get detailed in transit stock units with their materials."""
     stmt = (
         select(StockUnit, Material, MaterialType)
+        .options(joinedload(StockUnit.user))
         .join(Material, StockUnit.material_part_number == Material.material_part_number)
         .join(MaterialType, Material.material_type_id == MaterialType.material_type_id)
         .where(StockUnit.status == 'IN_TRANSIT')

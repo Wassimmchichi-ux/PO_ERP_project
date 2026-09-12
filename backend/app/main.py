@@ -16,7 +16,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.health import router as health_router
+from app.api.admin import router as admin_router
 from app.api.bom import router as bom_router
+from app.api.customer_delivery import router as customer_delivery_router
+from app.api.handover import router as handover_router
+from app.api.parsed_purchase_order import router as parsed_purchase_order_router
+from app.api.projects import router as projects_router
 from app.api.stock import router as stock_router
 from app.api.simulation import router as simulation_router
 from app.core.config import settings
@@ -71,9 +76,14 @@ def create_app() -> FastAPI:
 
     # Register API routers
     app.include_router(health_router)
+    app.include_router(admin_router)
     app.include_router(bom_router)
+    app.include_router(projects_router)
+    app.include_router(parsed_purchase_order_router)
     app.include_router(stock_router)
     app.include_router(simulation_router)
+    app.include_router(handover_router)
+    app.include_router(customer_delivery_router)
 
     return app
 

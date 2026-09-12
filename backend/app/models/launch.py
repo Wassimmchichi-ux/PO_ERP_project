@@ -17,8 +17,13 @@ class Launch(Base):
     launch_id: Mapped[int] = mapped_column(
         Integer,
         Identity(),
-        ForeignKey("Simulation.launch_id", deferrable=True, initially="IMMEDIATE"),
         primary_key=True,
+    )
+    simulation_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("Simulation.simulation_id", deferrable=True, initially="IMMEDIATE"),
+        unique=True,
+        nullable=False,
     )
     planned_date: Mapped[date] = mapped_column(Date, nullable=False)
     delivery_method_id: Mapped[int] = mapped_column(
@@ -53,6 +58,12 @@ class Launch(Base):
         ForeignKey("Document.document_id", deferrable=True, initially="IMMEDIATE"),
         nullable=False,
     )
+    cmr_document_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("Document.document_id", deferrable=True, initially="IMMEDIATE"),
+        nullable=True,
+    )
+    customer_delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
@@ -76,9 +87,15 @@ class Launch(Base):
         "Document",
         foreign_keys=[verification_document_id],
     )
+    cmr_document: Mapped["Document | None"] = relationship(
+        "Document",
+        foreign_keys=[cmr_document_id],
+    )
     simulation: Mapped["Simulation"] = relationship(
         "Simulation",
-        foreign_keys=[launch_id],
+        foreign_keys=[simulation_id],
+        back_populates="launch",
+        uselist=False,
     )
     launch_pos: Mapped[list["LaunchPO"]] = relationship(
         "LaunchPO",

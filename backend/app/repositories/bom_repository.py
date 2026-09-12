@@ -78,17 +78,29 @@ def find_fgpn_by_code(db: Session, fgpn_code: str) -> FGPN:
     Raises:
         ValidationException: If no FGPN with the given code exists.
     """
-    fgpn = db.execute(
+    fgpns = db.execute(
         select(FGPN).where(FGPN.fgpn_code == fgpn_code)
-    ).scalar_one_or_none()
+    ).scalars().all()
 
-    if fgpn is None:
+    if not fgpns:
         raise ValidationException(
             f"No FGPN found with part number '{fgpn_code}'. "
             f"The FGPN must already exist in the database before uploading a BOM.",
             details={"fgpn_code": fgpn_code},
         )
-    return fgpn
+    if len(fgpns) > 1:
+        raise ValidationException(
+            f"More than one FGPN found with part number '{fgpn_code}'. "
+            "FGPN is now scoped by PO, so upload must identify the target PO before saving this BOM.",
+            details={
+                "fgpn_code": fgpn_code,
+                "matches": [
+                    {"fgpn_id": item.fgpn_id, "po_id": item.po_id, "project_id": item.project_id}
+                    for item in fgpns
+                ],
+            },
+        )
+    return fgpns[0]
 
 
 def get_latest_version_by_fgpn_id(db: Session, fgpn_id: int) -> Optional[int]:

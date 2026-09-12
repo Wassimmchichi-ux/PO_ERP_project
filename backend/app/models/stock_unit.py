@@ -26,7 +26,7 @@ class StockUnit(Base):
         primary_key=True,
     )
     material_part_number: Mapped[str] = mapped_column(
-        String(100),
+        String(10),
         ForeignKey(
             "Material.material_part_number",
             deferrable=True,
@@ -59,11 +59,13 @@ class StockUnit(Base):
         Integer,
         ForeignKey("StockUnit.stock_unit_id", deferrable=True, initially="IMMEDIATE"),
         nullable=True,
+        comment="Set when a component/accessory package is split for launch issue traceability",
     )
     handover_document_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("Document.document_id", deferrable=True, initially="IMMEDIATE"),
         nullable=True,
+        comment="Signed handover document proving production received issued materials",
     )
     issued_to_production_at: Mapped[datetime | None] = mapped_column(
         DateTime,
@@ -102,8 +104,7 @@ class StockUnit(Base):
         ),
         nullable=True,
         comment=(
-            "it is an open point: a Launch engineer that recall for material "
-            "is it owned by him or it is owned by every other launch engineer"
+            "Optional affected launch engineer/manager. NULL means global enterprise stock."
         ),
     )
 

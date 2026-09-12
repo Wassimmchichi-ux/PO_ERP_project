@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String
 from sqlalchemy.dialects.postgresql import ENUM, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -12,6 +12,10 @@ from app.db.base import Base
 
 class LoginEvent(Base):
     __tablename__ = "login_events"
+    __table_args__ = (
+        Index("login_events_attempted_rn_occurred_at_idx", "attempted_rn", "occurred_at"),
+        {"comment": "Stores successful and failed attempts, including attempts for an unknown username."},
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -21,6 +25,7 @@ class LoginEvent(Base):
 
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
+        ForeignKey("users.id", deferrable=True, initially="IMMEDIATE"),
         nullable=False,
     )
 

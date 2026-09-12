@@ -1,0 +1,3 @@
+- verify what are the events that should be logged into the audit table.
+- read the code and verify 
+- include the launch_engineer attribute that 

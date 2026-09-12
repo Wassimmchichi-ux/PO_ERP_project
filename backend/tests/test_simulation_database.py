@@ -20,6 +20,7 @@ from app.models import (
     Document,
     FGPN,
     Launch,
+    ManufacturingReceiver,
     Project,
     PurchaseOrder,
     PurchaseOrderLine,
@@ -36,6 +37,7 @@ from app.schemas.simulation import (
     SimulationPreviewRequest,
     SimulationSaveRequest,
 )
+from app.schemas.stock import StockUnitReceptionRequest
 from app.services import material_simulation_service, stock_management_service
 from app.utils import bom_workbook_extractor as bom_xlsx
 from app.utils.bom_workbook_extractor import ParsedBom
@@ -44,6 +46,7 @@ from app.utils.bom_workbook_extractor import ParsedBom
 MBOM_PATH = Path(__file__).resolve().parents[2] / "MBOM_08_08_2025-02.xlsx"
 FGPN_CODES = ["6855872-7S08-000", "6855872-9K21-000"]
 TEST_USER_ID = uuid.UUID("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")
+LAUNCH_ENGINEER_ID = uuid.UUID("bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")
 
 
 @pytest.fixture()
@@ -74,7 +77,19 @@ def seeded_db(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> dict[str,
         must_change_password=False,
         created_at=now,
     )
-    db_session.add(user)
+    launch_engineer = User(
+        id=LAUNCH_ENGINEER_ID,
+        full_name="Wassim Mchichi",
+        registration_number="LE-001",
+        password_hash="test",
+        role="LAUNCH ENGINEER",
+        status="ACTIVE",
+        failed_login_count=0,
+        is_locked=False,
+        must_change_password=False,
+        created_at=now,
+    )
+    db_session.add_all([user, launch_engineer])
 
     project = Project(
         project_id=1,
@@ -102,7 +117,8 @@ def seeded_db(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> dict[str,
         updated_at=now,
     )
     delivery_method = DeliveryMethod(delivery_method_id=1, name="Truck", status="Active")
-    db_session.add_all([project, customer, contact, delivery_method])
+    receiver = ManufacturingReceiver(receiver_id=1, name="Main Production", status="Active")
+    db_session.add_all([project, customer, contact, delivery_method, receiver])
 
     for fgpn_id, fgpn_code in enumerate(FGPN_CODES, start=1):
         db_session.add(
@@ -149,7 +165,16 @@ def seeded_db(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> dict[str,
         uploaded_by=TEST_USER_ID,
         version=1,
     )
-    db_session.add_all([po_document, meeting_document])
+    verification_document = Document(
+        document_id=103,
+        document_type="LAUNCH_VERIFICATION",
+        file_name="launch-verification.pdf",
+        file_path="/tmp/launch-verification.pdf",
+        uploaded_at=now,
+        uploaded_by=TEST_USER_ID,
+        version=1,
+    )
+    db_session.add_all([po_document, meeting_document, verification_document])
 
     for index, fgpn_code in enumerate(FGPN_CODES, start=1):
         po_id = index
@@ -191,7 +216,14 @@ def seeded_db(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> dict[str,
         )
     db_session.commit()
 
-    return {"user_id": TEST_USER_ID, "meeting_document_id": 101}
+    return {
+        "user_id": TEST_USER_ID,
+        "launch_engineer_id": LAUNCH_ENGINEER_ID,
+        "meeting_document_id": 101,
+        "verification_document_id": 103,
+        "receiver_id": 1,
+        "delivery_method_id": 1,
+    }
 
 
 def test_preview_simulation_feasible_with_mbom_bom_and_stock_units(
@@ -303,6 +335,115 @@ def test_stock_management_service_uses_remaining_wip_and_in_transit(
     assert summary_by_material[material_part_number].in_transit_quantity == Decimal("25.0000")
 
 
+def test_record_stock_reception_can_affect_stock_to_launch_engineer(
+    db_session: Session,
+    seeded_db: dict[str, int | uuid.UUID],
+) -> None:
+    parsed = _parsed_mbom_for_fgpn(FGPN_CODES[0])
+    material_part_number = next(iter(_requirements_for(parsed, Decimal("1"))))
+
+    response = stock_management_service.record_stock_unit_reception(
+        db_session,
+        StockUnitReceptionRequest(
+            material_part_number=material_part_number,
+            quantity=Decimal("50"),
+            status="WAREHOUSE",
+            assigned_user_id=seeded_db["launch_engineer_id"],
+        ),
+        reception_user_id=seeded_db["user_id"],
+    )
+
+    stock_unit = db_session.get(StockUnit, response.stock_unit_id)
+
+    assert response.assigned_user_id == seeded_db["launch_engineer_id"]
+    assert response.assigned_user_name == "Wassim Mchichi"
+    assert stock_unit is not None
+    assert stock_unit.user_id == seeded_db["launch_engineer_id"]
+
+
+def test_owned_simulation_can_include_or_exclude_global_stock(
+    db_session: Session,
+    seeded_db: dict[str, int | uuid.UUID],
+) -> None:
+    parsed = _parsed_mbom_for_fgpn(FGPN_CODES[0])
+    requirements = _requirements_for(parsed, Decimal("4"))
+    _insert_stock_for_requirements(
+        db_session,
+        requirements,
+        quantity_factor=Decimal("1.2"),
+        owner_user_id=None,
+        stock_unit_id_start=1000,
+    )
+    _insert_stock_for_requirements(
+        db_session,
+        requirements,
+        quantity_factor=Decimal("0.25"),
+        owner_user_id=seeded_db["launch_engineer_id"],
+        stock_unit_id_start=2000,
+    )
+
+    all_stock_result = material_simulation_service.preview_simulation(
+        db_session,
+        SimulationPreviewRequest(
+            fgpns=[
+                FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("4")),
+            ],
+            allocation_strategy="PRIORITY",
+            include_in_transit=False,
+            safety_coefficient=Decimal("1"),
+        ),
+    )
+    owner_only_result = material_simulation_service.preview_simulation(
+        db_session,
+        SimulationPreviewRequest(
+            fgpns=[
+                FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("4")),
+            ],
+            allocation_strategy="PRIORITY",
+            include_in_transit=False,
+            safety_coefficient=Decimal("1"),
+            stock_scope_mode="OWNED_ONLY",
+            stock_owner_user_id=seeded_db["launch_engineer_id"],
+        ),
+    )
+    owner_plus_global_result = material_simulation_service.preview_simulation(
+        db_session,
+        SimulationPreviewRequest(
+            fgpns=[
+                FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("4")),
+            ],
+            allocation_strategy="PRIORITY",
+            include_in_transit=False,
+            safety_coefficient=Decimal("1"),
+            stock_scope_mode="OWNED_ONLY",
+            stock_owner_user_id=seeded_db["launch_engineer_id"],
+            include_global_stock=True,
+        ),
+    )
+
+    assert all_stock_result.is_feasible is True
+    assert all_stock_result.stock_scope_mode == "ALL"
+    assert owner_only_result.stock_scope_mode == "OWNED_ONLY"
+    assert owner_only_result.stock_owner_user_id == seeded_db["launch_engineer_id"]
+    assert owner_only_result.include_global_stock is False
+    assert owner_only_result.is_feasible is False
+    assert owner_only_result.total_launchable_quantity < Decimal("4")
+    assert owner_only_result.allocation_details
+    assert {
+        detail.assigned_user_id
+        for detail in owner_only_result.allocation_details
+        if detail.stock_unit_id is not None
+    } == {seeded_db["launch_engineer_id"]}
+    assert owner_plus_global_result.stock_scope_mode == "OWNED_ONLY"
+    assert owner_plus_global_result.include_global_stock is True
+    assert owner_plus_global_result.is_feasible is True
+    assert {
+        detail.assigned_user_id
+        for detail in owner_plus_global_result.allocation_details
+        if detail.stock_unit_id is not None
+    }.issubset({seeded_db["launch_engineer_id"], None})
+
+
 def test_save_simulation_does_not_create_launch_until_meeting_approval(
     db_session: Session,
     seeded_db: dict[str, int | uuid.UUID],
@@ -317,11 +458,9 @@ def test_save_simulation_does_not_create_launch_until_meeting_approval(
     response = material_simulation_service.save_simulation(
         db_session,
         SimulationSaveRequest(
-            launch_id=555,
             target_date=date(2026, 8, 25),
             mtg_minutes_document_id=seeded_db["meeting_document_id"],
             preview_request=SimulationPreviewRequest(
-                launch_id=555,
                 fgpns=[
                     FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("5")),
                 ],
@@ -338,6 +477,57 @@ def test_save_simulation_does_not_create_launch_until_meeting_approval(
     assert db_session.execute(select(func.count(Launch.launch_id))).scalar_one() == 0
 
 
+def test_saved_simulation_can_be_promoted_to_launch_record(
+    db_session: Session,
+    seeded_db: dict[str, int | uuid.UUID],
+) -> None:
+    parsed = _parsed_mbom_for_fgpn(FGPN_CODES[0])
+    _insert_stock_for_requirements(
+        db_session,
+        _requirements_for(parsed, Decimal("5")),
+        quantity_factor=Decimal("1.2"),
+    )
+
+    response = material_simulation_service.save_simulation(
+        db_session,
+        SimulationSaveRequest(
+            target_date=date(2026, 8, 25),
+            mtg_minutes_document_id=seeded_db["meeting_document_id"],
+            preview_request=SimulationPreviewRequest(
+                fgpns=[
+                    FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("5")),
+                ],
+                allocation_strategy="PRIORITY",
+                include_in_transit=False,
+                safety_coefficient=Decimal("1"),
+            ),
+        ),
+        user_id=str(seeded_db["user_id"]),
+    )
+
+    now = datetime(2026, 8, 25, 9, 0, 0)
+    launch = Launch(
+        simulation_id=response.simulation_id,
+        planned_date=date(2026, 8, 25),
+        delivery_method_id=seeded_db["delivery_method_id"],
+        receiver_id=seeded_db["receiver_id"],
+        status="PLANNED",
+        completed_by=seeded_db["user_id"],
+        verified_by=seeded_db["user_id"],
+        verification_document_id=seeded_db["verification_document_id"],
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(launch)
+    db_session.commit()
+
+    saved_launch = db_session.execute(select(Launch)).scalar_one()
+    saved_simulation = db_session.get(Simulation, response.simulation_id)
+
+    assert saved_launch.simulation_id == response.simulation_id
+    assert saved_simulation.launch.launch_id == saved_launch.launch_id
+
+
 def test_launch_saved_simulation_splits_component_stock_and_handover_moves_to_production(
     db_session: Session,
     seeded_db: dict[str, int | uuid.UUID],
@@ -351,11 +541,9 @@ def test_launch_saved_simulation_splits_component_stock_and_handover_moves_to_pr
     response = material_simulation_service.save_simulation(
         db_session,
         SimulationSaveRequest(
-            launch_id=556,
             target_date=date(2026, 8, 25),
             mtg_minutes_document_id=seeded_db["meeting_document_id"],
             preview_request=SimulationPreviewRequest(
-                launch_id=556,
                 fgpns=[
                     FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("5")),
                 ],
@@ -459,16 +647,19 @@ def _insert_stock_for_requirements(
     requirements: dict[str, Decimal],
     *,
     quantity_factor: Decimal,
+    owner_user_id: uuid.UUID | None = None,
+    stock_unit_id_start: int = 1,
 ) -> None:
     now = datetime(2026, 8, 24, 9, 0, 0)
     for index, (material_part_number, requirement) in enumerate(requirements.items(), start=1):
         db_session.add(
             StockUnit(
-                stock_unit_id=index,
+                stock_unit_id=stock_unit_id_start + index - 1,
                 material_part_number=material_part_number,
                 quantity=(requirement * quantity_factor).quantize(Decimal("0.0001")),
                 status="WAREHOUSE",
                 created_at=now,
+                user_id=owner_user_id,
             )
         )
     db_session.commit()

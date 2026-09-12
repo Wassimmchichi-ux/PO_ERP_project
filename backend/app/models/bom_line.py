@@ -23,12 +23,12 @@ class BOMLine(Base):
     )
     line_number: Mapped[int] = mapped_column(Integer, nullable=False)
     material_part_number: Mapped[str] = mapped_column(
-        String(100),
+        String(50),
         ForeignKey("Material.material_part_number", deferrable=True, initially="IMMEDIATE"),
         nullable=False,
     )
     coefficient: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
-    part_type: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    part_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     cover_revision: Mapped[str | None] = mapped_column(String(50), nullable=True)
     cover_pn: Mapped[str | None] = mapped_column(String(50), nullable=True)
     quantity_tpdm: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)

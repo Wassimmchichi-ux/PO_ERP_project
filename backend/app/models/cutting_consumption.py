@@ -20,7 +20,7 @@ class CuttingConsumption(Base):
         nullable=False,
     )
     material_part_number: Mapped[str] = mapped_column(
-        String(100),
+        String(10),
         ForeignKey("Material.material_part_number", deferrable=True, initially="IMMEDIATE"),
         nullable=False,
     )

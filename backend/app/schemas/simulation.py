@@ -1,6 +1,7 @@
 """Pydantic schemas for Simulation workflows."""
 from datetime import date
 from decimal import Decimal
+import uuid
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -16,7 +17,6 @@ class FgpnSimulationRequest(BaseModel):
 
 
 class SimulationPreviewRequest(BaseModel):
-    launch_id: Optional[int] = None
     project_id: Optional[int] = None
     fgpns: list[FgpnSimulationRequest] = Field(min_length=1)
     
@@ -26,12 +26,24 @@ class SimulationPreviewRequest(BaseModel):
     )
     include_in_transit: bool = False
     safety_coefficient: Decimal = Field(default=Decimal('2.0'), gt=0)
+    stock_scope_mode: str = Field(
+        default="ALL",
+        description="ALL or OWNED_ONLY. OWNED_ONLY filters physical stock units by stock_owner_user_id.",
+    )
+    stock_owner_user_id: Optional[uuid.UUID] = None
+    include_global_stock: bool = Field(
+        default=False,
+        description="When stock_scope_mode is OWNED_ONLY, also include global stock units with no assigned owner.",
+    )
 
 
 class AllocationDetail(BaseModel):
     stock_unit_id: Optional[int]  # None for virtual remaining production pool
     material_part_number: str
     source: str  # WAREHOUSE, PRODUCTION, IN_TRANSIT
+    assigned_user_id: Optional[uuid.UUID] = None
+    assigned_user_name: Optional[str] = None
+    assigned_user_role: Optional[str] = None
     is_whole_issue: bool = False
     available_quantity: Decimal
     allocated_quantity: Decimal
@@ -76,6 +88,9 @@ class FgpnSimulationSummary(BaseModel):
 
 class SimulationPreviewResult(BaseModel):
     stock_scope: str  # CURRENT_STOCK or INCLUDING_IN_TRANSIT
+    stock_scope_mode: str = "ALL"
+    stock_owner_user_id: Optional[uuid.UUID] = None
+    include_global_stock: bool = False
     allocation_strategy: str
     is_feasible: bool
     total_requested_quantity: Decimal
@@ -87,7 +102,6 @@ class SimulationPreviewResult(BaseModel):
 
 
 class SimulationSaveRequest(BaseModel):
-    launch_id: int
     preview_request: SimulationPreviewRequest
     target_date: date
     mtg_minutes_document_id: int

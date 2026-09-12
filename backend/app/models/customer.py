@@ -34,6 +34,7 @@ class Customer(Base):
         String(20),
         nullable=False,
         server_default="Active",
+        comment="Active, Inactive",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime,

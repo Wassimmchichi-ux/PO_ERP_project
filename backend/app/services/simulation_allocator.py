@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+import uuid
 from typing import Optional
 
 
@@ -16,6 +17,9 @@ class StockSlot:
     can_split: bool = True
     available: bool = True
     expected_arrival_date: Optional[datetime] = None
+    assigned_user_id: Optional[uuid.UUID] = None
+    assigned_user_name: Optional[str] = None
+    assigned_user_role: Optional[str] = None
     initial_quantity: Decimal = field(init=False)
 
     def __post_init__(self) -> None:

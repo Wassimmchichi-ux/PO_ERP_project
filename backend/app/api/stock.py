@@ -14,13 +14,26 @@ from app.schemas.stock import (
     MaterialStockDetailResponse,
     ProductionHandoverRequest,
     ProductionHandoverResponse,
-    StockDashboardStats
+    StockDashboardStats,
+    StockUnitReceptionRequest,
+    StockUnitReceptionResponse,
 )
+from app.repositories.bom_repository import _get_system_user
 from app.services import stock_management_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/stock", tags=["stock"])
+
+
+@router.post("/units/reception", response_model=StockUnitReceptionResponse, status_code=status.HTTP_201_CREATED)
+def record_stock_unit_reception(
+    request: StockUnitReceptionRequest,
+    db: Annotated[Session, Depends(get_db)]
+) -> StockUnitReceptionResponse:
+    """Record warehouse/in-transit stock and optionally affect it to a launch owner."""
+    user_id = _get_system_user(db)
+    return stock_management_service.record_stock_unit_reception(db, request, user_id)
 
 
 @router.get("/summary", response_model=StockSummaryListResponse)

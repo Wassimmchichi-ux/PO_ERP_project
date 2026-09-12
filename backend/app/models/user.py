@@ -12,6 +12,14 @@ from app.db.base import Base
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        {
+            "comment": (
+                "One role per user. Accounts are deactivated, never deleted, "
+                "so historical actions keep their actor."
+            )
+        },
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -36,7 +44,17 @@ class User(Base):
     )
 
     role: Mapped[str] = mapped_column(
-        ENUM("ADMIN","LAUNCH ENGINEER","LAUNCH MANAGER","PLANT MANAGER","WAREHOUSE TEAM LEADER","WAREHOUSE PERSONNEL", name="role_code", create_type=False),
+        ENUM(
+            "ADMIN",
+            "PLANT_MANAGER",
+            "LAUNCH_ENGINEER",
+            "LAUNCH_MANAGER",
+            "WAREHOUSE_Personnel",
+            "WAREHOUSE_TEAM_LEADER",
+            "MANUFACTURING_OPERATOR",
+            name="role_code",
+            create_type=False,
+        ),
         nullable=False,
     )
 
@@ -68,14 +86,14 @@ class User(Base):
         nullable=True,
     )
 
-    must_change_password: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        server_default="true",
-    )
-
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,
         server_default="now()",
+    )
+
+    must_change_password: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default="true",
     )

@@ -61,6 +61,13 @@ def _preview_suggestion(is_feasible: bool, material_summaries: list[MaterialSimu
     return f"Prioritize resolving material shortfalls for {shown} before launching the uncovered quantities."
 
 
+def _normalize_stock_scope_mode(mode: str | None) -> str:
+    normalized = (mode or "ALL").strip().upper()
+    if normalized not in {"ALL", "OWNED_ONLY"}:
+        raise ValidationException("stock_scope_mode must be ALL or OWNED_ONLY.")
+    return normalized
+
+
 def _is_roll_material_type(material_type_name: str | None, unit: str | None) -> bool:
     name = (material_type_name or "").strip().lower()
     normalized_unit = (unit or "").strip().lower()
@@ -73,15 +80,56 @@ def _is_roll_material_type(material_type_name: str | None, unit: str | None) -> 
     }
 
 
-def _build_pools(db: Session, include_in_transit: bool) -> dict[str, MaterialPool]:
+def _stock_owner_metadata(stock_unit) -> tuple[uuid.UUID | None, str | None, str | None]:
+    owner = getattr(stock_unit, "user", None)
+    return (
+        getattr(stock_unit, "user_id", None),
+        owner.full_name if owner else None,
+        owner.role if owner else None,
+    )
+
+
+def _build_pools(
+    db: Session,
+    include_in_transit: bool,
+    *,
+    stock_scope_mode: str = "ALL",
+    stock_owner_user_id: uuid.UUID | None = None,
+    include_global_stock: bool = False,
+) -> dict[str, MaterialPool]:
     """Build material pools by querying physical stock units."""
+    assigned_only = stock_scope_mode == "OWNED_ONLY"
     materials = stock_repository.get_all_materials(db)
-    wh_units = stock_repository.get_positive_stock_units_by_status(db, 'WAREHOUSE')
-    prod_sent_map = stock_repository.get_production_stock_by_material(db)
+    if assigned_only:
+        wh_units = stock_repository.get_positive_stock_units_by_status(
+            db,
+            'WAREHOUSE',
+            assigned_user_id=stock_owner_user_id,
+            assigned_only=True,
+            include_global_stock=include_global_stock,
+        )
+        prod_sent_map = stock_repository.get_production_stock_by_material(
+            db,
+            assigned_user_id=stock_owner_user_id,
+            assigned_only=True,
+            include_global_stock=include_global_stock,
+        )
+    else:
+        wh_units = stock_repository.get_positive_stock_units_by_status(db, 'WAREHOUSE')
+        prod_sent_map = stock_repository.get_production_stock_by_material(db)
     cons_map = stock_repository.get_cutting_consumption_by_material(db)
     transit_units = []
     if include_in_transit:
-        transit_units = stock_repository.get_positive_stock_units_by_status(db, 'IN_TRANSIT')
+        if assigned_only:
+            transit_units = stock_repository.get_positive_stock_units_by_status(
+                db,
+                'IN_TRANSIT',
+                assigned_user_id=stock_owner_user_id,
+                assigned_only=True,
+                include_global_stock=include_global_stock,
+            )
+        else:
+            transit_units = stock_repository.get_positive_stock_units_by_status(db, 'IN_TRANSIT')
         
     pools = {}
     for mat, mtype in materials:
@@ -94,13 +142,17 @@ def _build_pools(db: Session, include_in_transit: bool) -> dict[str, MaterialPoo
         
         # Add warehouse
         for su in [u for u in wh_units if u.material_part_number == mpn]:
+            assigned_user_id, assigned_user_name, assigned_user_role = _stock_owner_metadata(su)
             pool.warehouse_slots.append(StockSlot(
                 stock_unit_id=su.stock_unit_id,
                 source='WAREHOUSE',
                 quantity=su.quantity,
                 material_type=mtype.name,
                 can_split=not is_roll,
-                expected_arrival_date=su.expected_arrival_date
+                expected_arrival_date=su.expected_arrival_date,
+                assigned_user_id=assigned_user_id,
+                assigned_user_name=assigned_user_name,
+                assigned_user_role=assigned_user_role,
             ))
             
         # Add production (we create one virtual slot for the remaining qty)
@@ -108,22 +160,32 @@ def _build_pools(db: Session, include_in_transit: bool) -> dict[str, MaterialPoo
         consumed = cons_map.get(mpn, Decimal('0'))
         rem = _compute_remaining_production(sent, consumed)
         if rem > 0:
+            owner = None
+            if assigned_only and stock_owner_user_id is not None:
+                owner = stock_repository.get_user(db, stock_owner_user_id)
             pool.production_slots.append(StockSlot(
                 stock_unit_id=None,  # Virtual slot representing aggregated production remainder
                 source='PRODUCTION',
                 quantity=rem,
-                material_type=mtype.name
+                material_type=mtype.name,
+                assigned_user_id=stock_owner_user_id if assigned_only else None,
+                assigned_user_name=owner.full_name if owner else None,
+                assigned_user_role=owner.role if owner else None,
             ))
             
         # Add in-transit
         for su in [u for u in transit_units if u.material_part_number == mpn]:
+            assigned_user_id, assigned_user_name, assigned_user_role = _stock_owner_metadata(su)
             pool.in_transit_slots.append(StockSlot(
                 stock_unit_id=su.stock_unit_id,
                 source='IN_TRANSIT',
                 quantity=su.quantity,
                 material_type=mtype.name,
                 can_split=not is_roll,
-                expected_arrival_date=su.expected_arrival_date
+                expected_arrival_date=su.expected_arrival_date,
+                assigned_user_id=assigned_user_id,
+                assigned_user_name=assigned_user_name,
+                assigned_user_role=assigned_user_role,
             ))
             
         pools[mpn] = pool
@@ -135,6 +197,15 @@ def preview_simulation(db: Session, request: SimulationPreviewRequest) -> Simula
     """Run a read-only simulation."""
     if not request.fgpns:
         raise ValidationException("At least one FGPN is required for simulation.")
+    stock_scope_mode = _normalize_stock_scope_mode(request.stock_scope_mode)
+    if stock_scope_mode == "OWNED_ONLY":
+        if request.stock_owner_user_id is None:
+            raise ValidationException("stock_owner_user_id is required when stock_scope_mode is OWNED_ONLY.")
+        stock_owner = stock_repository.get_user(db, request.stock_owner_user_id)
+        if stock_owner is None:
+            raise ValidationException(f"Stock owner user {request.stock_owner_user_id} not found.")
+        if not stock_repository.is_affectable_stock_owner(stock_owner):
+            raise ValidationException("Owned-only simulation owner must be a launch engineer or launch manager.")
         
     fgpn_ids = [f.fgpn_id for f in request.fgpns]
     po_line_ids = [f.po_line_id for f in request.fgpns if f.po_line_id is not None]
@@ -222,14 +293,31 @@ def preview_simulation(db: Session, request: SimulationPreviewRequest) -> Simula
         demands.append(demand)
         
     # 2. Build Stock Pools
-    pools = _build_pools(db, request.include_in_transit)
+    if stock_scope_mode == "OWNED_ONLY":
+        pools = _build_pools(
+            db,
+            request.include_in_transit,
+            stock_scope_mode=stock_scope_mode,
+            stock_owner_user_id=request.stock_owner_user_id,
+            include_global_stock=request.include_global_stock,
+        )
+    else:
+        pools = _build_pools(db, request.include_in_transit)
     
     # 3. Run Allocator
     demands, allocations = run_allocation_engine(demands, pools, request.allocation_strategy)
     
     # 4. Format Results
     mat_map = {m.material_part_number: (m, mt) for m, mt in stock_repository.get_all_materials(db) if m.material_part_number}
-    in_transit_stock = stock_repository.get_in_transit_stock_by_material(db)
+    if stock_scope_mode == "OWNED_ONLY":
+        in_transit_stock = stock_repository.get_in_transit_stock_by_material(
+            db,
+            assigned_user_id=request.stock_owner_user_id,
+            assigned_only=True,
+            include_global_stock=request.include_global_stock,
+        )
+    else:
+        in_transit_stock = stock_repository.get_in_transit_stock_by_material(db)
     
     # Aggregate material summaries
     mat_summaries = {}
@@ -334,6 +422,9 @@ def preview_simulation(db: Session, request: SimulationPreviewRequest) -> Simula
             stock_unit_id=slot.stock_unit_id,
             material_part_number=mpn,
             source=slot.source,
+            assigned_user_id=slot.assigned_user_id,
+            assigned_user_name=slot.assigned_user_name,
+            assigned_user_role=slot.assigned_user_role,
             is_whole_issue=not slot.can_split,
             available_quantity=slot.initial_quantity,
             allocated_quantity=data['allocated'],
@@ -347,6 +438,9 @@ def preview_simulation(db: Session, request: SimulationPreviewRequest) -> Simula
         
     return SimulationPreviewResult(
         stock_scope='INCLUDING_IN_TRANSIT' if request.include_in_transit else 'CURRENT_STOCK',
+        stock_scope_mode=stock_scope_mode,
+        stock_owner_user_id=request.stock_owner_user_id if stock_scope_mode == "OWNED_ONLY" else None,
+        include_global_stock=request.include_global_stock if stock_scope_mode == "OWNED_ONLY" else False,
         allocation_strategy=request.allocation_strategy,
         is_feasible=is_feasible,
         total_requested_quantity=total_requested,
@@ -387,8 +481,10 @@ def save_simulation(db: Session, request: SimulationSaveRequest, user_id: str) -
             
     sim_id = simulation_repository.save_simulation(
         db,
-        launch_id=request.launch_id,
         simulation_mode=preview.stock_scope,
+        stock_scope_mode=preview.stock_scope_mode,
+        stock_owner_user_id=preview.stock_owner_user_id,
+        include_global_stock=preview.include_global_stock,
         allocation_strategy=preview.allocation_strategy,
         target_date=request.target_date,
         safety_coefficient=request.preview_request.safety_coefficient,
@@ -420,7 +516,6 @@ def _saved_simulation_preview_request(
     selected_fgpns,
 ) -> SimulationPreviewRequest:
     return SimulationPreviewRequest(
-        launch_id=simulation.launch_id,
         fgpns=[
             FgpnSimulationRequest(
                 po_id=row.po_id,
@@ -433,6 +528,9 @@ def _saved_simulation_preview_request(
         allocation_strategy=simulation.allocation_strategy,
         include_in_transit=simulation.simulation_mode == 'INCLUDING_IN_TRANSIT',
         safety_coefficient=simulation.safety_coefficient,
+        stock_scope_mode=simulation.stock_scope_mode,
+        stock_owner_user_id=simulation.stock_owner_user_id,
+        include_global_stock=simulation.include_global_stock,
     )
 
 

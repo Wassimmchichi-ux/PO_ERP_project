@@ -1,0 +1,459 @@
+API TEST COMMANDS
+=================
+
+Assumptions:
+- App is running at http://localhost:8080
+- You are running commands from any terminal.
+- jq is optional but useful for extracting IDs from responses.
+- Replace IDs at the top if your database uses different values.
+
+
+0) COMMON VARIABLES
+-------------------
+
+export API_URL="http://localhost:8080"
+export ROOT="/home/wassimmchichi/Downloads/launch_po_backend_m0"
+export PARSED_PO_JSON="$ROOT/2301416000.json"
+export BOM_XLSX="$ROOT/MBOM_08_08_2025-02.xlsx"
+
+# These IDs must exist in your database for import/simulation.
+export PROJECT_ID=1
+export CUSTOMER_ID=1
+export CONTACT_ID=1
+export DELIVERY_METHOD_ID=1
+
+# Fill these after creating/importing data.
+export PARSED_PO_ID=1
+export PO_ID=1
+export FGPN_ID=1
+export PO_LINE_ID=1
+export SIMULATION_ID=1
+export MTG_MINUTES_DOCUMENT_ID=1
+export STOCK_UNIT_ID=1
+export HANDOVER_DOCUMENT_ID=1
+export MATERIAL_PART_NUMBER="CHANGE_ME"
+export LAUNCH_ENGINEER_USER_ID="CHANGE_ME_UUID"
+
+
+1) HEALTH
+---------
+
+curl -X GET "$API_URL/health" \
+  -H "accept: application/json"
+
+
+2) BOM UPLOAD
+-------------
+
+# Upload one BOM workbook.
+# Note: this requires the FGPN from the workbook to already exist in FGPN.
+curl -X POST "$API_URL/boms/upload" \
+  -H "accept: application/json" \
+  -F "files=@$BOM_XLSX;type=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" \
+  -F "development_level=series" \
+  -F "uploaded_by=SYSTEM" \
+  -F "notes=API test upload"
+
+
+3) PARSED PO WORKFLOW
+---------------------
+
+3.1) Upload Parsed PO JSON File
+
+curl -X POST "$API_URL/purchase-orders/parsed/upload-json" \
+  -H "accept: application/json" \
+  -F "file=@$PARSED_PO_JSON;type=application/json"
+
+# Optional: save the response and extract parsed_po_id.
+curl -s -X POST "$API_URL/purchase-orders/parsed/upload-json" \
+  -F "file=@$PARSED_PO_JSON;type=application/json" \
+  | tee /tmp/parsed_po_upload_response.json
+
+export PARSED_PO_ID=$(jq -r '.parsed_po_id' /tmp/parsed_po_upload_response.json)
+echo "$PARSED_PO_ID"
+
+
+3.2) Create Parsed PO From JSON Body
+
+# Use this only if your frontend already has the parsed JSON object.
+# For file testing, prefer /upload-json above.
+curl -X POST "$API_URL/purchase-orders/parsed" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_file_name": "2301416000.json",
+    "parser_name": "external-po-parser",
+    "parser_version": "1",
+    "parsed_payload": {
+      "po_number": "2301416000",
+      "version": "1",
+      "line_count": 1,
+      "stated_total": 689.64,
+      "computed_total": 689.64,
+      "totals_match": true,
+      "lines": [
+        {
+          "line_no": "00001",
+          "plant": "7142",
+          "due_date": "2025-11-01",
+          "material_group": "907010",
+          "part_number": "5618912-9L43-AL",
+          "description": "RB40%LH COMF. ART. FAB.",
+          "customer_part_ref": "A1749200600",
+          "item_category": "Prototype Parts",
+          "quantity": 21,
+          "unit_price": 32.84,
+          "total": 689.64
+        }
+      ]
+    }
+  }'
+
+
+3.3) Get Parsed PO Review Data
+
+curl -X GET "$API_URL/purchase-orders/parsed/$PARSED_PO_ID" \
+  -H "accept: application/json"
+
+
+3.4) Save Corrections
+
+# Important:
+# - Do not send the full parsed PO response here.
+# - Send only correction diffs.
+# - lines[0] means first JSON array item, not PO line number 00001.
+# - Validation is automatically run after corrections are saved.
+# - Response status becomes VALIDATED if clean, otherwise CORRECTED.
+curl -X PUT "$API_URL/purchase-orders/parsed/$PARSED_PO_ID/corrections" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "corrections": [
+      {
+        "field_path": "lines[0].quantity",
+        "corrected_value": 22
+      },
+      {
+        "field_path": "contact_email",
+        "corrected_value": "launch@example.com"
+      }
+    ]
+  }'
+
+
+3.5) Validate Corrected Parsed PO
+
+# Optional recheck. Corrections already trigger validation automatically.
+curl -X POST "$API_URL/purchase-orders/parsed/$PARSED_PO_ID/validate" \
+  -H "accept: application/json"
+
+
+3.6) Import Corrected Parsed PO Into Real PO Tables
+
+# This creates/updates:
+# - PurchaseOrder
+# - PurchaseOrderVersion
+# - PurchaseOrderLine
+# - FGPN
+# - FGPNPriceHistory, if existing FGPN price changed
+curl -X POST "$API_URL/purchase-orders/parsed/$PARSED_PO_ID/import" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"project_id\": $PROJECT_ID,
+    \"customer_id\": $CUSTOMER_ID,
+    \"contact_id\": $CONTACT_ID,
+    \"delivery_method_id\": $DELIVERY_METHOD_ID,
+    \"change_reason\": \"Imported from corrected parsed PO\"
+  }"
+
+# Optional: save import response.
+curl -s -X POST "$API_URL/purchase-orders/parsed/$PARSED_PO_ID/import" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"project_id\": $PROJECT_ID,
+    \"customer_id\": $CUSTOMER_ID,
+    \"contact_id\": $CONTACT_ID,
+    \"delivery_method_id\": $DELIVERY_METHOD_ID,
+    \"change_reason\": \"Imported from corrected parsed PO\"
+  }" | tee /tmp/parsed_po_import_response.json
+
+export PO_ID=$(jq -r '.po_id' /tmp/parsed_po_import_response.json)
+echo "$PO_ID"
+
+
+4) STOCK ENDPOINTS
+------------------
+
+4.1) Stock Summary
+
+curl -X GET "$API_URL/stock/summary" \
+  -H "accept: application/json"
+
+
+4.2) Production/WIP Stock
+
+curl -X GET "$API_URL/stock/production" \
+  -H "accept: application/json"
+
+
+4.3) In-Transit Stock
+
+curl -X GET "$API_URL/stock/in-transit" \
+  -H "accept: application/json"
+
+
+4.4) In-Transit Stock With Date Filter
+
+curl -X GET "$API_URL/stock/in-transit?from_date=2025-11-01&to_date=2025-12-31" \
+  -H "accept: application/json"
+
+
+4.5) Today's In-Transit Arrivals
+
+curl -X GET "$API_URL/stock/in-transit/today" \
+  -H "accept: application/json"
+
+
+4.6) Stock Dashboard
+
+curl -X GET "$API_URL/stock/dashboard" \
+  -H "accept: application/json"
+
+
+4.7) Material Stock Detail
+
+curl -X GET "$API_URL/stock/materials/$MATERIAL_PART_NUMBER" \
+  -H "accept: application/json"
+
+
+4.8) Record Stock Reception With Optional Launch Owner
+
+# assigned_user_id is optional. Omit it or set null for global enterprise stock.
+# When present, the user must be a LAUNCH ENGINEER or LAUNCH MANAGER.
+curl -X POST "$API_URL/stock/units/reception" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"material_part_number\": \"$MATERIAL_PART_NUMBER\",
+    \"quantity\": \"800\",
+    \"status\": \"WAREHOUSE\",
+    \"assigned_user_id\": \"$LAUNCH_ENGINEER_USER_ID\"
+  }"
+
+# Example for in-transit stock.
+curl -X POST "$API_URL/stock/units/reception" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"material_part_number\": \"$MATERIAL_PART_NUMBER\",
+    \"quantity\": \"250\",
+    \"status\": \"IN_TRANSIT\",
+    \"expected_arrival_date\": \"2026-09-10T09:00:00\",
+    \"assigned_user_id\": \"$LAUNCH_ENGINEER_USER_ID\"
+  }"
+
+
+4.9) Confirm Production Handover
+
+# Requires:
+# - stock unit status must be ISSUED_TO_PRODUCTION
+# - handover_document_id must reference an existing Document
+curl -X POST "$API_URL/stock/units/$STOCK_UNIT_ID/production-handover" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"handover_document_id\": $HANDOVER_DOCUMENT_ID
+  }"
+
+
+5) SIMULATION ENDPOINTS
+-----------------------
+
+5.1) Preview Simulation
+
+# Requires:
+# - PO_ID exists
+# - FGPN_ID exists
+# - PO_LINE_ID belongs to PO_ID + FGPN_ID
+# - current BOM exists for FGPN_ID
+# - stock exists if you want feasible result
+curl -X POST "$API_URL/simulations/preview" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"project_id\": $PROJECT_ID,
+    \"fgpns\": [
+      {
+        \"po_id\": $PO_ID,
+        \"fgpn_id\": $FGPN_ID,
+        \"po_line_id\": $PO_LINE_ID,
+        \"requested_quantity\": \"10\"
+      }
+    ],
+    \"allocation_strategy\": \"PRIORITY\",
+    \"include_in_transit\": false,
+    \"safety_coefficient\": \"1.0\",
+    \"stock_scope_mode\": \"ALL\"
+  }"
+
+
+5.2) Preview Simulation Using Only Stock Affected To One Launch Owner
+
+# With include_global_stock=false, this mode ignores global stock and stock affected to other launch users.
+# Allocation details still show assigned_user_id/name/role so the draft document
+# can include the owner of each selected stock unit.
+curl -X POST "$API_URL/simulations/preview" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"project_id\": $PROJECT_ID,
+    \"fgpns\": [
+      {
+        \"po_id\": $PO_ID,
+        \"fgpn_id\": $FGPN_ID,
+        \"po_line_id\": $PO_LINE_ID,
+        \"requested_quantity\": \"10\"
+      }
+    ],
+    \"allocation_strategy\": \"PRIORITY\",
+    \"include_in_transit\": false,
+    \"safety_coefficient\": \"1.0\",
+    \"stock_scope_mode\": \"OWNED_ONLY\",
+    \"stock_owner_user_id\": \"$LAUNCH_ENGINEER_USER_ID\",
+    \"include_global_stock\": false
+  }"
+
+
+5.3) Preview Simulation Using Launch Owner Stock Plus Global Stock
+
+# This mode uses stock affected to the launch owner plus stock where StockUnit.user_id is null.
+curl -X POST "$API_URL/simulations/preview" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"project_id\": $PROJECT_ID,
+    \"fgpns\": [
+      {
+        \"po_id\": $PO_ID,
+        \"fgpn_id\": $FGPN_ID,
+        \"po_line_id\": $PO_LINE_ID,
+        \"requested_quantity\": \"10\"
+      }
+    ],
+    \"allocation_strategy\": \"PRIORITY\",
+    \"include_in_transit\": false,
+    \"safety_coefficient\": \"1.0\",
+    \"stock_scope_mode\": \"OWNED_ONLY\",
+    \"stock_owner_user_id\": \"$LAUNCH_ENGINEER_USER_ID\",
+    \"include_global_stock\": true
+  }"
+
+
+5.4) Save Simulation
+
+# Requires an existing Document id for mtg_minutes_document_id.
+curl -X POST "$API_URL/simulations" \
+  -H "accept: application/json" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"target_date\": \"2026-09-15\",
+    \"mtg_minutes_document_id\": $MTG_MINUTES_DOCUMENT_ID,
+    \"preview_request\": {
+      \"project_id\": $PROJECT_ID,
+      \"fgpns\": [
+        {
+          \"po_id\": $PO_ID,
+          \"fgpn_id\": $FGPN_ID,
+          \"po_line_id\": $PO_LINE_ID,
+          \"requested_quantity\": \"10\"
+        }
+      ],
+      \"allocation_strategy\": \"PRIORITY\",
+      \"include_in_transit\": false,
+      \"safety_coefficient\": \"1.0\",
+      \"stock_scope_mode\": \"ALL\",
+      \"include_global_stock\": false
+    }
+  }"
+
+# Optional: save simulation response.
+curl -s -X POST "$API_URL/simulations" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"target_date\": \"2026-09-15\",
+    \"mtg_minutes_document_id\": $MTG_MINUTES_DOCUMENT_ID,
+    \"preview_request\": {
+      \"project_id\": $PROJECT_ID,
+      \"fgpns\": [
+        {
+          \"po_id\": $PO_ID,
+          \"fgpn_id\": $FGPN_ID,
+          \"po_line_id\": $PO_LINE_ID,
+          \"requested_quantity\": \"10\"
+        }
+      ],
+      \"allocation_strategy\": \"PRIORITY\",
+      \"include_in_transit\": false,
+      \"safety_coefficient\": \"1.0\",
+      \"stock_scope_mode\": \"ALL\",
+      \"include_global_stock\": false
+    }
+  }" | tee /tmp/simulation_save_response.json
+
+export SIMULATION_ID=$(jq -r '.simulation_id' /tmp/simulation_save_response.json)
+echo "$SIMULATION_ID"
+
+
+5.5) Launch Review
+
+curl -X POST "$API_URL/simulations/$SIMULATION_ID/launch-review" \
+  -H "accept: application/json"
+
+
+5.6) Launch Saved Simulation
+
+# This issues selected stock units to production as launch allocations.
+curl -X POST "$API_URL/simulations/$SIMULATION_ID/launch" \
+  -H "accept: application/json"
+
+
+6) HELPFUL DATABASE LOOKUPS FOR IDS
+-----------------------------------
+
+# Run from repo root if you use docker-compose DB.
+# These are not API endpoints, but they help fill PO_ID, FGPN_ID, PO_LINE_ID, etc.
+
+docker compose exec -T db psql -U postgres -d po_database -c 'select project_id, project_code, name from "Project";'
+
+docker compose exec -T db psql -U postgres -d po_database -c 'select customer_id, customer_code, name from "Customer";'
+
+docker compose exec -T db psql -U postgres -d po_database -c 'select contact_id, customer_id, name from "Contact";'
+
+docker compose exec -T db psql -U postgres -d po_database -c 'select delivery_method_id, name from "DeliveryMethod";'
+
+docker compose exec -T db psql -U postgres -d po_database -c 'select po_id, po_number, current_version_id from "PurchaseOrder" order by po_id desc limit 10;'
+
+docker compose exec -T db psql -U postgres -d po_database -c 'select fgpn_id, project_id, fgpn_code, unit_price from "FGPN" order by fgpn_id desc limit 20;'
+
+docker compose exec -T db psql -U postgres -d po_database -c 'select po_line_id, po_version_id, line_number, fgpn_id, ordered_quantity from "PurchaseOrderLine" order by po_line_id desc limit 20;'
+
+docker compose exec -T db psql -U postgres -d po_database -c 'select po.po_id, po.po_number, pol.po_line_id, f.fgpn_id, f.fgpn_code, pol.ordered_quantity from "PurchaseOrder" po join "PurchaseOrderVersion" pov on pov.po_id = po.po_id and pov.po_version_id = po.current_version_id join "PurchaseOrderLine" pol on pol.po_version_id = pov.po_version_id join "FGPN" f on f.fgpn_id = pol.fgpn_id order by po.po_id desc, pol.line_number limit 30;'
+
+docker compose exec -T db psql -U postgres -d po_database -c 'select document_id, document_type, file_name from "Document" order by document_id desc limit 20;'
+
+docker compose exec -T db psql -U postgres -d po_database -c 'select id, full_name, role from "users" where role in ('\''LAUNCH ENGINEER'\'', '\''LAUNCH MANAGER'\'') order by full_name;'
+
+docker compose exec -T db psql -U postgres -d po_database -c 'select stock_unit_id, material_part_number, quantity, status, user_id from "StockUnit" order by stock_unit_id desc limit 20;'
+
+
+7) MIGRATIONS
+-------------
+
+# Run migrations against docker-compose DB.
+cd /home/wassimmchichi/Downloads/launch_po_backend_m0/backend
+DEBUG=false DATABASE_URL=postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/po_database UV_CACHE_DIR=/tmp/uv-cache uv run alembic upgrade head
+
+# Check current migration.
+cd /home/wassimmchichi/Downloads/launch_po_backend_m0/backend
+DEBUG=false DATABASE_URL=postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/po_database UV_CACHE_DIR=/tmp/uv-cache uv run alembic current

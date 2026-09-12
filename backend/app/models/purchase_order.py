@@ -24,10 +24,10 @@ class PurchaseOrder(Base):
         ForeignKey("Contact.contact_id", deferrable=True, initially="IMMEDIATE"),
         nullable=False,
     )
-    current_version_id: Mapped[int] = mapped_column(
+    current_version_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("PurchaseOrderVersion.po_version_id", deferrable=True, initially="IMMEDIATE"),
-        nullable=False,
+        nullable=True,
     )
     current_status: Mapped[str] = mapped_column(
         String(30),

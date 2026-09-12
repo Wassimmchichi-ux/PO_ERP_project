@@ -153,8 +153,10 @@ def add_stock_allocations(
 def save_simulation(
     db: Session,
     *,
-    launch_id: int,
     simulation_mode: str,
+    stock_scope_mode: str,
+    stock_owner_user_id: uuid.UUID | None,
+    include_global_stock: bool,
     allocation_strategy: str,
     target_date: datetime.date,
     safety_coefficient: Decimal,
@@ -168,8 +170,10 @@ def save_simulation(
     """Save the official simulation and its allocations."""
     
     sim = Simulation(
-        launch_id=launch_id,
         simulation_mode=simulation_mode,
+        stock_scope_mode=stock_scope_mode,
+        stock_owner_user_id=stock_owner_user_id,
+        include_global_stock=include_global_stock,
         allocation_strategy=allocation_strategy,
         target_date=target_date,
         safety_coefficient=safety_coefficient,

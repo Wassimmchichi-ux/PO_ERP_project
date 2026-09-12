@@ -19,6 +19,12 @@ class PurchaseOrderLine(Base):
             "line_number",
             unique=True,
         ),
+        Index(
+            "PurchaseOrderLine_po_version_id_fgpn_id_idx",
+            "po_version_id",
+            "fgpn_id",
+            unique=True,
+        ),
     )
 
     po_line_id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)

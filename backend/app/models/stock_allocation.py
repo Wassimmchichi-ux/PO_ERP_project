@@ -31,7 +31,11 @@ class StockAllocation(Base):
         server_default="SIMULATION",
         comment="SIMULATION, LAUNCH",
     )
-    is_whole_issue: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    is_whole_issue: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default="false",
+    )
     source_location: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
@@ -40,8 +44,8 @@ class StockAllocation(Base):
     status: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
-        server_default="Reserved",
-        comment="Reserved, Released, Delivered",
+        server_default="SIMULATED",
+        comment="SIMULATED, ISSUED_TO_PRODUCTION, RESERVED, RELEASED, DELIVERED",
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 

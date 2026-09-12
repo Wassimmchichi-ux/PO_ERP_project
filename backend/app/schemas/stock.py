@@ -1,9 +1,10 @@
 """Pydantic schemas for Stock Management workflows."""
 from datetime import date, datetime
 from decimal import Decimal
+import uuid
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class StockSummaryItem(BaseModel):
@@ -49,6 +50,9 @@ class InTransitItem(BaseModel):
     expected_arrival_date: Optional[date]
     days_until_arrival: Optional[int]
     status: str
+    assigned_user_id: Optional[uuid.UUID] = None
+    assigned_user_name: Optional[str] = None
+    assigned_user_role: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -87,3 +91,25 @@ class ProductionHandoverResponse(BaseModel):
     stock_unit_id: int
     status: str = "PRODUCTION"
     material_detail: MaterialStockDetailResponse
+
+
+class StockUnitReceptionRequest(BaseModel):
+    material_part_number: str
+    quantity: Decimal = Field(gt=0)
+    status: str = Field(default="WAREHOUSE", description="WAREHOUSE or IN_TRANSIT")
+    expected_arrival_date: Optional[datetime] = None
+    assigned_user_id: Optional[uuid.UUID] = None
+
+
+class StockUnitReceptionResponse(BaseModel):
+    stock_unit_id: int
+    material_part_number: str
+    quantity: Decimal
+    status: str
+    expected_arrival_date: Optional[datetime] = None
+    assigned_user_id: Optional[uuid.UUID] = None
+    assigned_user_name: Optional[str] = None
+    assigned_user_role: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)

@@ -24,15 +24,18 @@ class MaterialType(Base):
         String(50),
         unique=True,
         nullable=False,
+        comment="c, m, s",
     )
     unit: Mapped[str] = mapped_column(
         String(10),
         nullable=False,
+        comment="m, kg, pcs, etc.",
     )
     status: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
         server_default="Active",
+        comment="Active, Inactive",
     )
 
     materials: Mapped[list[Material]] = relationship(

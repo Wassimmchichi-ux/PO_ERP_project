@@ -4,7 +4,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import ForeignKey, Integer, Numeric, String
+from sqlalchemy import ForeignKey, Identity, Integer, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -19,16 +19,16 @@ class Material(Base):
 
     id: Mapped[int] = mapped_column(
         Integer,
+        Identity(),
         primary_key=True,
-        autoincrement=True,
     )
     material_part_number: Mapped[str | None] = mapped_column(
-        String(100),
+        String(50),
         unique=True,
         nullable=True,
     )
     description: Mapped[str] = mapped_column(
-        String(50),
+        String(200),
         nullable=False,
     )
     material_type_id: Mapped[int] = mapped_column(
@@ -41,9 +41,10 @@ class Material(Base):
         nullable=False,
     )
     status: Mapped[str] = mapped_column(
-        String(20),
+        String(50),
         nullable=False,
         server_default="Active",
+        comment="Active, Inactive",
     )
     critical_threshold: Mapped[Decimal | None] = mapped_column(
         Numeric(10, 4),
