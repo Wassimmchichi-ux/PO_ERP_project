@@ -71,7 +71,7 @@ def seed_documents(engine, source_dir: Path):
         if db.scalar(select(Project).where(Project.project_code == "BUSINESS-TEST")):
             raise RuntimeError("Business-test seed already exists. Use --reset when deliberately replacing the disposable test dataset.")
         now = datetime.now()
-        engineer = User(id=uuid.uuid4(), full_name="Business Test Engineer", registration_number="DOC-ENGINEER",
+        engineer = User(id=uuid.uuid4(), full_name="Avery Cole", registration_number="DOC-ENGINEER",
             role="LAUNCH_ENGINEER", password_hash="development-placeholder", status="ACTIVE", created_at=now)
         db.add(engineer)
         db.flush()
