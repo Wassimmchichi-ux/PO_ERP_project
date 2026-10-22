@@ -1,3 +1,5 @@
+> Historical documentation. This describes an earlier implementation and may contain superseded behavior, paths, or test results. For the working-tree review dated 21 October 2026, use the [business documentation](../../docs/BUSINESS_DOCUMENTATION.md) and [technical documentation](../../docs/TECHNICAL_DOCUMENTATION.md).
+
 # Simulation And Stock Services Recap
 
 This recap summarizes the current simulation, stock, PO/FGPN, and test changes so the next implementation step can be reviewed deliberately.

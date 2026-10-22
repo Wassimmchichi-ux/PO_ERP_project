@@ -47,7 +47,7 @@ class FGPN(Base):
         nullable=True,
     )
     unit_price: Mapped[Decimal] = mapped_column(
-        Numeric(10, 4),
+        Numeric(14, 5),
         nullable=False,
     )
     status: Mapped[str] = mapped_column(

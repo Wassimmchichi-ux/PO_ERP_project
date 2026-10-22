@@ -5,11 +5,13 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Identity, Index, Integer, String
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Identity, Index, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+JSON_VALUE = JSONB().with_variant(JSON(), "sqlite")
 
 
 class ParsedPurchaseOrderCorrection(Base):
@@ -34,8 +36,8 @@ class ParsedPurchaseOrderCorrection(Base):
         nullable=False,
         comment="Header field or nested path like lines[0].quantity",
     )
-    original_value: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
-    corrected_value: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    original_value: Mapped[Any | None] = mapped_column(JSON_VALUE, nullable=True)
+    corrected_value: Mapped[Any | None] = mapped_column(JSON_VALUE, nullable=True)
     confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     corrected_by: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

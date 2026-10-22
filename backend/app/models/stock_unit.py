@@ -26,7 +26,7 @@ class StockUnit(Base):
         primary_key=True,
     )
     material_part_number: Mapped[str] = mapped_column(
-        String(10),
+        String(50),
         ForeignKey(
             "Material.material_part_number",
             deferrable=True,

@@ -14,9 +14,7 @@ from app.models.cutting_consumption import CuttingConsumption
 from app.models.material import Material
 from app.models.material_type import MaterialType
 from app.models.user import User
-
-
-_AFFECTABLE_STOCK_OWNER_ROLES = {"LAUNCH ENGINEER", "LAUNCH MANAGER"}
+from app.policies.rules import is_assignable_stock_owner
 
 
 def get_warehouse_stock_by_material(
@@ -69,6 +67,7 @@ def get_in_transit_stock_by_material(
     assigned_user_id: uuid.UUID | None = None,
     assigned_only: bool = False,
     include_global_stock: bool = False,
+    target_date: date | None = None,
 ) -> dict[str, Decimal]:
     """Returns total in transit quantity per material_part_number."""
     stmt = (
@@ -77,7 +76,10 @@ def get_in_transit_stock_by_material(
             func.coalesce(func.sum(StockUnit.quantity), 0).label('total_qty')
         )
         .where(StockUnit.status == 'IN_TRANSIT')
+        .where(StockUnit.quantity > 0)
     )
+    if target_date is not None:
+        stmt = stmt.where(func.date(StockUnit.expected_arrival_date) <= target_date)
     if assigned_only:
         stmt = _filter_by_stock_owner_scope(stmt, assigned_user_id, include_global_stock)
     stmt = stmt.group_by(StockUnit.material_part_number)
@@ -115,6 +117,7 @@ def get_positive_stock_units_by_status(
     assigned_user_id: uuid.UUID | None = None,
     assigned_only: bool = False,
     include_global_stock: bool = False,
+    target_date: date | None = None,
 ) -> list[StockUnit]:
     """Get positive-quantity stock units for one stock status."""
     stmt = (
@@ -123,6 +126,8 @@ def get_positive_stock_units_by_status(
         .where(StockUnit.status == status)
         .where(StockUnit.quantity > 0)
     )
+    if target_date is not None:
+        stmt = stmt.where(func.date(StockUnit.expected_arrival_date) <= target_date)
     if assigned_only:
         stmt = _filter_by_stock_owner_scope(stmt, assigned_user_id, include_global_stock)
     return db.execute(stmt).scalars().all()
@@ -154,8 +159,7 @@ def get_user(db: Session, user_id: uuid.UUID) -> User | None:
 
 def is_affectable_stock_owner(user: User) -> bool:
     """Return whether stock can be affected to this user."""
-    role = str(user.role).replace("_", " ").upper()
-    return role in _AFFECTABLE_STOCK_OWNER_ROLES
+    return is_assignable_stock_owner(user.role)
 
 
 def create_stock_unit_reception(

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String
+from sqlalchemy import func, text, Boolean, DateTime, Integer, String
 from sqlalchemy.dialects.postgresql import ENUM, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,7 +24,8 @@ class User(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
-        server_default="gen_random_uuid()",
+        default=uuid.uuid4,
+        server_default=text("(gen_random_uuid())"),
     )
 
     full_name: Mapped[str] = mapped_column(
@@ -89,7 +90,7 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,
-        server_default="now()",
+        server_default=func.now(),
     )
 
     must_change_password: Mapped[bool] = mapped_column(

@@ -42,7 +42,7 @@ class MaterialPool:
         return sum((s.remaining for s in self.all_slots()), Decimal('0'))
 
     def all_slots(self) -> list[StockSlot]:
-        return self.warehouse_slots + self.production_slots + self.in_transit_slots
+        return self.production_slots + self.warehouse_slots + self.in_transit_slots
 
 
 @dataclass
@@ -94,8 +94,8 @@ def allocate_material(
     """Greedy + Local Refinement allocation algorithm.
     
     Tries to allocate `demand` from `pool` in a specific order:
-    1. WAREHOUSE
-    2. PRODUCTION
+    1. PRODUCTION
+    2. WAREHOUSE
     3. IN_TRANSIT
     
     Inside each source, it sorts by remaining quantity ASC to minimize leftovers,
@@ -112,7 +112,7 @@ def allocate_material(
     allocations = []
     remaining_demand = demand
 
-    for source_slots in (pool.warehouse_slots, pool.production_slots, pool.in_transit_slots):
+    for source_slots in (pool.production_slots, pool.warehouse_slots, pool.in_transit_slots):
         if remaining_demand <= 0:
             break
 

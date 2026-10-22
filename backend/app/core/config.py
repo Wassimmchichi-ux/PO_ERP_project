@@ -49,6 +49,21 @@ class Settings(BaseSettings):
     # to the rest of the app as a parsed list via ALLOWED_ORIGINS_LIST.
     ALLOWED_ORIGINS: str = ""
 
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def parse_debug_flag(cls, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "on", "debug", "development", "dev"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "release", "production", "prod"}:
+            return False
+        raise ValueError(f"DEBUG must be a boolean-like value, got {value!r}")
+
     @field_validator("LOG_LEVEL")
     @classmethod
     def validate_log_level(cls, value: str) -> str:
@@ -83,4 +98,3 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
-print("DATABASE URL USED:", settings.DATABASE_URL)

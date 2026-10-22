@@ -25,6 +25,10 @@ class SimulationPreviewRequest(BaseModel):
         description="PRIORITY, MANUAL, or PRIORITY_PLUS_MANUAL"
     )
     include_in_transit: bool = False
+    target_date: Optional[date] = Field(
+        default=None,
+        description="Required when including in-transit stock; only arrivals on or before this date qualify.",
+    )
     safety_coefficient: Decimal = Field(default=Decimal('2.0'), gt=0)
     stock_scope_mode: str = Field(
         default="ALL",
@@ -87,6 +91,7 @@ class FgpnSimulationSummary(BaseModel):
 
 
 class SimulationPreviewResult(BaseModel):
+    target_date: Optional[date] = None
     stock_scope: str  # CURRENT_STOCK or INCLUDING_IN_TRANSIT
     stock_scope_mode: str = "ALL"
     stock_owner_user_id: Optional[uuid.UUID] = None

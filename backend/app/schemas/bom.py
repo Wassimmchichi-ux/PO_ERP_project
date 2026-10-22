@@ -46,6 +46,7 @@ class BomMaterialLineResponse(BaseModel):
     quantity_tpdm: Optional[Decimal] = None
     total_quantity: Optional[Decimal] = None
     unit: Optional[str] = None
+    source_unit: Optional[str] = Field(default=None, description="Original workbook UNIT; no conversion is implied.")
     total_sqm: Optional[Decimal] = None
     raw_row: Optional[dict[str, Any]] = None
 
@@ -127,7 +128,7 @@ class BomUploadResult(BaseModel):
 
     Contains a summary count and the full detail of every BOM version that
     was created during the upload request.  One version is created per
-    uploaded file.
+    discovered FGPN in each uploaded file.
     """
 
     uploaded_count: int

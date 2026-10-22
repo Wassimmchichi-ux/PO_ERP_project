@@ -1,74 +1,35 @@
-"""Compatibility checks between parsed PO JSON and simulation inputs."""
-from __future__ import annotations
-
-import json
-import zipfile
-from io import BytesIO
+"""Verify the supplied PO formats and report unresolved PO/BOM associations."""
 from pathlib import Path
+import pytest
 
-from app.utils import bom_workbook_extractor as bom_xlsx
+from app.services.parsed_purchase_order_service import _parse_simple_purchase_order_payload
+from app.utils.bom_workbook_extractor import parse_bom_workbook_many
 
-
-ROOT = Path(__file__).resolve().parents[2]
-PARSED_PO_PATH = ROOT / "2301438886.json"
-MBOM_PATH = ROOT / "MBOM_08_08_2025-02.xlsx"
-
-
-def test_parsed_po_has_fields_needed_to_create_po_lines_for_simulation() -> None:
-    """Parsed PO rows have enough data to seed PurchaseOrderLine rows."""
-    parsed_po = json.loads(PARSED_PO_PATH.read_text())
-
-    assert parsed_po["po_number"] == "2301438886"
-    assert parsed_po["version"] == "2"
-    assert parsed_po["line_count"] == len(parsed_po["lines"]) == 27
-    assert parsed_po["totals_match"] is True
-
-    first_line = parsed_po["lines"][0]
-    assert {
-        "line_no",
-        "part_number",
-        "description",
-        "quantity",
-        "unit_price",
-        "due_date",
-    }.issubset(first_line)
+BUSINESS_TEST = Path(__file__).resolve().parents[2] / "ressources" / "business-test"
+PO_DOCUMENTS = [
+    ("Adient PO 2301480082.pdf", "2301480082", 14),
+    ("Adient PO 2301478532.PDF", "2301478532", 50),
+    ("Adient PO 2301438886.pdf", "2301438886", 27),
+]
 
 
-def test_parsed_po_part_numbers_must_be_resolved_to_bom_fgpn_codes() -> None:
-    """The parser output uses PO revision codes, while MBOM uses BOM FGPN codes."""
-    parsed_po = json.loads(PARSED_PO_PATH.read_text())
-    po_part_numbers = [line["part_number"] for line in parsed_po["lines"]]
-    mbom_fgpn_codes = _mbom_fgpn_codes()
-
-    exact_matches = [part for part in po_part_numbers if part in mbom_fgpn_codes]
-    normalized_matches = {
-        part: _mbom_candidates_for_po_part(part, mbom_fgpn_codes)
-        for part in po_part_numbers
-    }
-    normalized_matches = {
-        part: candidates
-        for part, candidates in normalized_matches.items()
-        if candidates
-    }
-
-    assert exact_matches == []
-    assert len(normalized_matches) == 9
-    assert normalized_matches["6855879-9E43-AF"] == ["6855879-9E43-000"]
-    assert normalized_matches["7197885-5F94-AE"] == ["7197885-5F94-000"]
-    assert "7417370-8AC3-AD" not in normalized_matches
+@pytest.mark.parametrize("filename,number,count", PO_DOCUMENTS)
+def test_purchase_orders_have_fields_needed_for_simulation_inputs(filename, number, count):
+    payload = _parse_simple_purchase_order_payload((BUSINESS_TEST / filename).read_bytes())
+    assert payload["po_number"] == number and payload["version"] == 1
+    assert payload["line_count"] == len(payload["lines"]) == count
+    assert payload["totals_match"] is True
+    for line in payload["lines"]:
+        assert {"line_no", "part_number", "description", "quantity", "unit_price", "due_date"} <= line.keys()
+        assert line["part_number"] and line["due_date"]
 
 
-def _mbom_fgpn_codes() -> set[str]:
-    with zipfile.ZipFile(BytesIO(MBOM_PATH.read_bytes())) as workbook:
-        shared_strings = bom_xlsx._read_shared_strings(workbook)
-        sheet_path = bom_xlsx._find_sheet_path(workbook, bom_xlsx._SOURCE_SHEET_NAME)
-        rows = bom_xlsx._read_sheet_rows(workbook, sheet_path, shared_strings)
-
-    header_row_number, header_map = bom_xlsx._find_header_row(rows)
-    return bom_xlsx._discover_fgpns(rows, header_row_number, header_map)
-
-
-def _mbom_candidates_for_po_part(po_part_number: str, mbom_fgpn_codes: set[str]) -> list[str]:
-    """Match PO revision suffixes to BOM FGPN codes with the same base."""
-    base = po_part_number.rsplit("-", 1)[0]
-    return sorted(code for code in mbom_fgpn_codes if code.startswith(f"{base}-"))
+@pytest.mark.parametrize("filename,number,count", PO_DOCUMENTS)
+def test_new_documents_require_explicit_po_bom_mapping(filename, number, count):
+    """Independent test samples must not be silently treated as matching orders."""
+    payload = _parse_simple_purchase_order_payload((BUSINESS_TEST / filename).read_bytes())
+    path = BUSINESS_TEST / "MBOM 07_08_2026-02-Test.xlsx"
+    boms = parse_bom_workbook_many(path.read_bytes(), source_filename=path.name)
+    codes = {bom.finished_good_part_number for bom in boms}
+    assert codes == {"6134635-AD40-000", "6134635-AT43-000"}
+    assert not codes.intersection(line["part_number"] for line in payload["lines"])

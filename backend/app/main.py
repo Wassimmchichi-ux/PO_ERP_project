@@ -80,6 +80,8 @@ def create_app() -> FastAPI:
     app.include_router(bom_router)
     app.include_router(projects_router)
     app.include_router(parsed_purchase_order_router)
+    from app.api.cutting_reports import router as cutting_reports_router
+    app.include_router(cutting_reports_router)
     app.include_router(stock_router)
     app.include_router(simulation_router)
     app.include_router(handover_router)

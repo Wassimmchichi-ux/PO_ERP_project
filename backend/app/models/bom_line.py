@@ -35,6 +35,9 @@ class BOMLine(Base):
     cover_description: Mapped[str | None] = mapped_column(String(200), nullable=True)
     total_quantity: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
     total_sqm: Mapped[Decimal | None] = mapped_column(Numeric(10,4), nullable=True)
+    source_unit: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, comment="Original workbook UNIT, without unit conversion"
+    )
 
     bom: Mapped["BOM"] = relationship("BOM", back_populates="lines")
     material: Mapped["Material"] = relationship("Material", back_populates="bom_lines")

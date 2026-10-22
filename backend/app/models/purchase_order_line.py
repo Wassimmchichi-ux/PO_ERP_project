@@ -45,7 +45,7 @@ class PurchaseOrderLine(Base):
     description: Mapped[str | None] = mapped_column(String(255), nullable=True)
     trim_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
     ordered_quantity: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
-    unit_price: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    unit_price: Mapped[Decimal] = mapped_column(Numeric(14, 5), nullable=False)
     delivery_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     pickup_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     delivery_method_id: Mapped[int] = mapped_column(

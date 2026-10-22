@@ -63,3 +63,10 @@ class UnauthorizedException(AppException):
 
     status_code = 401
     error_code = "UNAUTHORIZED"
+
+
+class ForbiddenException(AppException):
+    """Raised when an authenticated user is not allowed to perform an action."""
+
+    status_code = 403
+    error_code = "FORBIDDEN"

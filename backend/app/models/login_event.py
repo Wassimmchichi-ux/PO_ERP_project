@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String
+from sqlalchemy import func, text, Boolean, DateTime, ForeignKey, Index, String
 from sqlalchemy.dialects.postgresql import ENUM, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -20,7 +20,8 @@ class LoginEvent(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         primary_key=True,
-        server_default="gen_random_uuid()",
+        default=uuid.uuid4,
+        server_default=text("(gen_random_uuid())"),
     )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -60,5 +61,5 @@ class LoginEvent(Base):
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,
-        server_default="now()",
+        server_default=func.now(),
     )

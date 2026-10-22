@@ -1,3 +1,5 @@
+> Historical documentation. This describes an earlier implementation and may contain superseded behavior, paths, or test results. For the working-tree review dated 21 October 2026, use the [business documentation](../../docs/BUSINESS_DOCUMENTATION.md) and [technical documentation](../../docs/TECHNICAL_DOCUMENTATION.md).
+
 # End-To-End Launch PO Workflow Documentation
 
 This document explains the complete workflow from receiving a parsed PO JSON file until launching production and confirming material handover.

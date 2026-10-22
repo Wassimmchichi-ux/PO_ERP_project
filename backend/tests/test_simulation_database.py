@@ -2,18 +2,22 @@
 from __future__ import annotations
 
 import uuid
-import zipfile
+import asyncio
 from datetime import date, datetime
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
+from tempfile import SpooledTemporaryFile
 
 import pytest
+from fastapi import UploadFile
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.base import Base
 from app.models import (
+    BOM,
+    BOMLine,
     Contact,
     Customer,
     DeliveryMethod,
@@ -21,6 +25,8 @@ from app.models import (
     FGPN,
     Launch,
     ManufacturingReceiver,
+    Material,
+    MaterialType,
     Project,
     PurchaseOrder,
     PurchaseOrderLine,
@@ -38,15 +44,23 @@ from app.schemas.simulation import (
     SimulationSaveRequest,
 )
 from app.schemas.stock import StockUnitReceptionRequest
-from app.services import material_simulation_service, stock_management_service
-from app.utils import bom_workbook_extractor as bom_xlsx
-from app.utils.bom_workbook_extractor import ParsedBom
+from app.services import bom_extraction_service, material_simulation_service, stock_management_service
+from app.exceptions.base import ValidationException
+from app.utils.bom_workbook_extractor import ParsedBom, parse_bom_workbook_many
 
 
-MBOM_PATH = Path(__file__).resolve().parents[2] / "MBOM_08_08_2025-02.xlsx"
-FGPN_CODES = ["6855872-7S08-000", "6855872-9K21-000"]
+MBOM_PATH = Path(__file__).resolve().parents[2] / "ressources" / "business-test" / "MBOM 07_08_2026-02-Test.xlsx"
+FGPN_CODES = ["6134635-AD40-000", "6134635-AT43-000"]
 TEST_USER_ID = uuid.UUID("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")
 LAUNCH_ENGINEER_ID = uuid.UUID("bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")
+
+
+@pytest.fixture()
+def business_workbook_upload():
+    with SpooledTemporaryFile(max_size=1024 * 1024) as workbook:
+        workbook.write(MBOM_PATH.read_bytes())
+        workbook.seek(0)
+        yield UploadFile(filename=MBOM_PATH.name, file=workbook)
 
 
 @pytest.fixture()
@@ -82,7 +96,7 @@ def seeded_db(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> dict[str,
         full_name="Wassim Mchichi",
         registration_number="LE-001",
         password_hash="test",
-        role="LAUNCH ENGINEER",
+        role="LAUNCH_ENGINEER",
         status="ACTIVE",
         failed_login_count=0,
         is_locked=False,
@@ -224,6 +238,68 @@ def seeded_db(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> dict[str,
         "receiver_id": 1,
         "delivery_method_id": 1,
     }
+
+
+def test_new_business_workbook_upload_preserves_units_and_versions_each_fgpn(
+    db_session: Session,
+    seeded_db: dict[str, int | uuid.UUID],
+    business_workbook_upload: UploadFile,
+) -> None:
+    result = asyncio.run(bom_extraction_service.upload_bom_files(
+        db_session,
+        [business_workbook_upload],
+        project_id=1,
+    ))
+
+    assert result.uploaded_count == 2
+    assert [version.finished_good_part_number for version in result.versions] == FGPN_CODES
+    assert [version.version for version in result.versions] == [2, 2]
+    for version in result.versions:
+        assert version.material_row_count == 3
+        assert [line.source_unit for line in version.material_lines] == ["ME", "EA", "EA"]
+        assert [line.unit for line in version.material_lines] == ["ME", "EA", "EA"]
+        assert version.material_lines[0].total_sqm == Decimal("0.2669")
+        assert version.material_lines[0].total_quantity == Decimal("0")
+    assert db_session.scalar(select(func.count()).select_from(BOM)) == 4
+    assert db_session.scalar(select(func.count()).select_from(Material)) == 4
+    current_boms = db_session.scalars(select(BOM).where(BOM.is_current.is_(True))).all()
+    assert len(current_boms) == 2
+    assert {bom.version for bom in current_boms} == {2}
+
+
+def test_multi_fgpn_upload_rolls_back_all_versions_if_a_later_save_fails(
+    db_session: Session,
+    seeded_db: dict[str, int | uuid.UUID],
+    monkeypatch: pytest.MonkeyPatch,
+    business_workbook_upload: UploadFile,
+) -> None:
+    initial_documents = db_session.scalar(select(func.count()).select_from(Document))
+    save_bom = bom_repository.save_bom_version
+
+    def save_until_second_fgpn(db: Session, **kwargs):
+        if kwargs["parsed_bom"].finished_good_part_number == FGPN_CODES[1]:
+            raise ValidationException("Test failure in second BOM")
+        return save_bom(db, **kwargs)
+
+    monkeypatch.setattr(bom_repository, "save_bom_version", save_until_second_fgpn)
+    with pytest.raises(ValidationException, match="second BOM"):
+        asyncio.run(bom_extraction_service.upload_bom_files(
+            db_session,
+            [business_workbook_upload],
+            project_id=1,
+        ))
+
+    assert db_session.scalar(select(func.count()).select_from(BOM)) == 2
+    assert db_session.scalar(select(func.count()).select_from(Document)) == initial_documents
+    assert all(bom.version == 1 and bom.is_current for bom in db_session.scalars(select(BOM)))
+
+
+def test_bom_upload_rejects_legacy_binary_excel_with_a_conversion_message(db_session: Session) -> None:
+    with pytest.raises(ValidationException, match="convert legacy .xls files to .xlsx"):
+        asyncio.run(bom_extraction_service.upload_bom_files(
+            db_session,
+            [UploadFile(filename="legacy.xls", file=BytesIO(b"legacy workbook"))],
+        ))
 
 
 def test_preview_simulation_feasible_with_mbom_bom_and_stock_units(
@@ -538,6 +614,20 @@ def test_launch_saved_simulation_splits_component_stock_and_handover_moves_to_pr
         _requirements_for(parsed, Decimal("5")),
         quantity_factor=Decimal("1.2"),
     )
+    # Add an explicit component so the partial-package regression remains
+    # independent of changes to the reference workbook's material mix.
+    component_type = MaterialType(name="TEST_COMPONENT", unit="pcs")
+    db_session.add(component_type)
+    db_session.flush()
+    db_session.add(Material(material_part_number="TEST-COMP", description="Test component",
+        material_type_id=component_type.material_type_id, unit_price=Decimal("1")))
+    db_session.flush()
+    bom = db_session.scalars(select(BOM).where(BOM.fgpn_id == 1, BOM.is_current.is_(True))).one()
+    bom.lines.append(BOMLine(line_number=max(line.line_number for line in bom.lines) + 1,
+        material_part_number="TEST-COMP", part_type="S", coefficient=Decimal("1"), total_quantity=Decimal("1")))
+    db_session.add(StockUnit(material_part_number="TEST-COMP", quantity=Decimal("6"),
+        status="WAREHOUSE", created_at=datetime(2026, 8, 24)))
+    db_session.commit()
     response = material_simulation_service.save_simulation(
         db_session,
         SimulationSaveRequest(
@@ -603,25 +693,8 @@ def test_launch_saved_simulation_splits_component_stock_and_handover_moves_to_pr
 
 
 def _parsed_mbom_for_fgpn(fgpn_code: str) -> ParsedBom:
-    with zipfile.ZipFile(BytesIO(MBOM_PATH.read_bytes())) as workbook:
-        shared_strings = bom_xlsx._read_shared_strings(workbook)
-        sheet_path = bom_xlsx._find_sheet_path(workbook, bom_xlsx._SOURCE_SHEET_NAME)
-        rows = bom_xlsx._read_sheet_rows(workbook, sheet_path, shared_strings)
-
-    header_row_number, header_map = bom_xlsx._find_header_row(rows)
-    lines = bom_xlsx._extract_material_lines(rows, header_row_number, header_map, fgpn_code)
-    assert lines, f"Expected MBOM lines for {fgpn_code}"
-
-    first_raw_row = lines[0].raw_row
-    return ParsedBom(
-        finished_good_part_number=fgpn_code,
-        finished_good_description=first_raw_row.get("Cover description"),
-        source_filename=MBOM_PATH.name,
-        source_reported_by=bom_xlsx._clean_optional(bom_xlsx._cell_value(rows, 2, 3)),
-        source_report_date=bom_xlsx._parse_report_date(rows),
-        source_report_time=bom_xlsx._parse_report_time(rows),
-        lines=lines,
-    )
+    parsed = parse_bom_workbook_many(MBOM_PATH.read_bytes(), source_filename=MBOM_PATH.name)
+    return next(bom for bom in parsed if bom.finished_good_part_number == fgpn_code)
 
 
 def _requirements_for(parsed_bom: ParsedBom, quantity: Decimal) -> dict[str, Decimal]:

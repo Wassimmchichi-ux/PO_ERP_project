@@ -7,6 +7,7 @@ from app.models.bom_line import BOMLine
 from app.models.contact import Contact
 from app.models.correction_event import CorrectionEvent
 from app.models.cutting_consumption import CuttingConsumption
+from app.models.cutting_report_import import CuttingReportImport
 from app.models.customer import Customer
 from app.models.delivery_method import DeliveryMethod
 from app.models.document import Document
@@ -68,6 +69,7 @@ __all__ = [
     "SimulationFGPN",
     "StockAllocation",
     "CuttingConsumption",
+    "CuttingReportImport",
     "LaunchVerification",
     "StockIssueHandover",
 ]

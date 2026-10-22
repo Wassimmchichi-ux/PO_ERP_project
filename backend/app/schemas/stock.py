@@ -2,9 +2,14 @@
 from datetime import date, datetime
 from decimal import Decimal
 import uuid
-from typing import Optional
+from typing import Annotated, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+
+class ExpectedArrivalUpdateRequest(BaseModel):
+    expected_arrival_date: date
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
 
 
 class StockSummaryItem(BaseModel):

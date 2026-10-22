@@ -3,15 +3,23 @@
 Provides operational queries for warehouse, production (WIP), and in-transit stock.
 """
 import logging
+import json
+import uuid
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.exceptions.base import NotFoundException, ValidationException
+from app.exceptions.base import ConflictException, NotFoundException, ValidationException
+from app.models.audit_log import AuditLog
+from app.models.stock_unit import StockUnit
+from app.policies import PolicyActor, policy_engine, system_actor
 from app.repositories import stock_repository
+from app.policies.rules import is_assignable_stock_owner
 from app.schemas.stock import (
+    ExpectedArrivalUpdateRequest,
     StockSummaryItem,
     ProductionStockItem,
     InTransitItem,
@@ -132,6 +140,47 @@ def get_todays_arrivals(db: Session) -> list[InTransitItem]:
     return get_in_transit_stock(db, from_date=today, to_date=today)
 
 
+def update_expected_arrival(
+    db: Session,
+    stock_unit_id: int,
+    request: ExpectedArrivalUpdateRequest,
+    user_id: uuid.UUID,
+    *,
+    actor: PolicyActor,
+) -> InTransitItem:
+    """Reschedule an open supplier delivery and record its previous date and reason."""
+    policy_engine.require(actor, "stock.transit.write")
+    stock_unit = db.execute(
+        select(StockUnit).where(StockUnit.stock_unit_id == stock_unit_id).with_for_update()
+    ).scalar_one_or_none()
+    if stock_unit is None:
+        raise NotFoundException(f"StockUnit {stock_unit_id} not found.")
+    if stock_unit.status != "IN_TRANSIT":
+        raise ConflictException("Only in-transit stock can have its expected arrival date changed.")
+    previous_date = stock_unit.expected_arrival_date.date() if stock_unit.expected_arrival_date else None
+    material_info = stock_repository.get_material_with_type(db, stock_unit.material_part_number)
+    if material_info is None:
+        raise NotFoundException(f"Material {stock_unit.material_part_number} not found.")
+    if previous_date != request.expected_arrival_date:
+        stock_unit.expected_arrival_date = datetime.combine(request.expected_arrival_date, datetime.min.time())
+        stock_unit.updated_at = datetime.now()
+        db.add(AuditLog(
+            user_id=user_id,
+            action="UPDATE_EXPECTED_ARRIVAL",
+            entity_type="StockUnit",
+            entity_id=stock_unit_id,
+            timestamp=stock_unit.updated_at,
+            reason=request.reason,
+            details=json.dumps({
+                "previous_expected_arrival_date": previous_date.isoformat() if previous_date else None,
+                "expected_arrival_date": request.expected_arrival_date.isoformat(),
+                "actor_role": actor.role,
+            }),
+        ))
+    db.commit()
+    return _build_in_transit_item(stock_unit, *material_info)
+
+
 def get_material_stock_detail(db: Session, material_part_number: str) -> MaterialStockDetailResponse:
     mat_info = stock_repository.get_material_with_type(db, material_part_number)
     if not mat_info:
@@ -186,8 +235,16 @@ def get_dashboard_stats(db: Session) -> StockDashboardStats:
     )
 
 
-def confirm_production_handover(db: Session, stock_unit_id: int, handover_document_id: int) -> MaterialStockDetailResponse:
+def confirm_production_handover(
+    db: Session,
+    stock_unit_id: int,
+    handover_document_id: int,
+    *,
+    actor: Optional[PolicyActor] = None,
+) -> MaterialStockDetailResponse:
     """Confirm production received an issued stock unit using a signed handover document."""
+    policy_engine.require(actor or system_actor(), "handover.confirm")
+
     stock_units = stock_repository.get_stock_units_by_ids(db, [stock_unit_id])
     stock_unit = stock_units.get(stock_unit_id)
     if stock_unit is None:
@@ -210,8 +267,13 @@ def record_stock_unit_reception(
     db: Session,
     request: StockUnitReceptionRequest,
     reception_user_id,
+    *,
+    actor: Optional[PolicyActor] = None,
 ) -> StockUnitReceptionResponse:
     """Record a warehouse/in-transit stock unit and optional launch owner."""
+    acting_actor = actor or system_actor()
+    policy_engine.require(acting_actor, "stock.receive")
+
     if request.status not in {"WAREHOUSE", "IN_TRANSIT"}:
         raise ValidationException("Stock reception status must be WAREHOUSE or IN_TRANSIT.")
     if request.status == "IN_TRANSIT" and request.expected_arrival_date is None:
@@ -225,7 +287,8 @@ def record_stock_unit_reception(
         assigned_user = stock_repository.get_user(db, request.assigned_user_id)
         if assigned_user is None:
             raise NotFoundException(f"Assigned user {request.assigned_user_id} not found.")
-        if not stock_repository.is_affectable_stock_owner(assigned_user):
+        policy_engine.require(acting_actor, "stock.assign_owner")
+        if not is_assignable_stock_owner(assigned_user.role):
             raise ValidationException("Stock can only be affected to a launch engineer or launch manager.")
 
     stock_unit = stock_repository.create_stock_unit_reception(

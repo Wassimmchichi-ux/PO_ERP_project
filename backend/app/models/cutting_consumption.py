@@ -20,7 +20,7 @@ class CuttingConsumption(Base):
         nullable=False,
     )
     material_part_number: Mapped[str] = mapped_column(
-        String(10),
+        String(50),
         ForeignKey("Material.material_part_number", deferrable=True, initially="IMMEDIATE"),
         nullable=False,
     )
@@ -32,6 +32,11 @@ class CuttingConsumption(Base):
         nullable=False,
     )
     consumed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    source_report_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("CuttingReportImport.report_id"), nullable=True,
+    )
+    source_row_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_event_fingerprint: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
 
     launch: Mapped["Launch"] = relationship(
         "Launch",

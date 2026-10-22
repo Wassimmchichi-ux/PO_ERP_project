@@ -5,11 +5,13 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, Identity, Integer, String
+from sqlalchemy import JSON, DateTime, ForeignKey, Identity, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+JSON_DOCUMENT = JSONB().with_variant(JSON(), "sqlite")
 
 
 class ParsedPurchaseOrder(Base):
@@ -30,7 +32,7 @@ class ParsedPurchaseOrder(Base):
         server_default="PARSED",
         comment="PARSED, CORRECTED, VALIDATED, IMPORTED, REJECTED",
     )
-    parsed_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    parsed_payload: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
     validated_po_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("PurchaseOrder.po_id", deferrable=True, initially="IMMEDIATE"),

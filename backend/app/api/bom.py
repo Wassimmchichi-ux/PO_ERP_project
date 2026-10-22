@@ -22,7 +22,9 @@ from typing import Annotated, Optional
 from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 from sqlalchemy.orm import Session
 
+from app.dependencies.auth import get_current_policy_actor
 from app.dependencies.db import get_db
+from app.policies import PolicyActor
 from app.schemas.bom import BomUploadResult
 from app.services.bom_extraction_service import upload_bom_files
 
@@ -37,10 +39,12 @@ router = APIRouter(prefix="/boms", tags=["bom"])
     status_code=status.HTTP_201_CREATED,
     summary="Upload one or more BOM Excel workbooks",
     description=(
-        "Accepts one or more `.xlsx`/`.xls` BOM workbooks as a multipart upload. "
+        "Accepts one or more `.xlsx` BOM workbooks as a multipart upload. "
         "The Finished-Good Part Number is extracted automatically from each workbook. "
         "The version is auto-incremented based on the latest stored version for that "
         "part number (starts at 1 for new BOMs). "
+        "A single workbook may contain several FGPNs; one BOM version is created "
+        "for every discovered FGPN. "
         "Optional metadata fields (`development_level`, `uploaded_by`, `notes`) "
         "are applied uniformly to every BOM version created in this request."
     ),
@@ -48,9 +52,10 @@ router = APIRouter(prefix="/boms", tags=["bom"])
 async def upload_bom(
     files: Annotated[
         list[UploadFile],
-        File(description="One or more Excel BOM workbooks (.xlsx or .xls)."),
+        File(description="One or more Excel BOM workbooks (.xlsx)."),
     ],
     db: Annotated[Session, Depends(get_db)],
+    actor: Annotated[PolicyActor, Depends(get_current_policy_actor)],
     development_level: Annotated[
         Optional[str],
         Form(description="Optional development-level tag (e.g. 'proto', 'series')."),
@@ -62,6 +67,10 @@ async def upload_bom(
     notes: Annotated[
         Optional[str],
         Form(description="Optional free-text notes for the created BOM version(s)."),
+    ] = None,
+    project_id: Annotated[
+        Optional[int],
+        Form(description="Optional project id used when an FGPN code exists in several projects."),
     ] = None,
 ) -> BomUploadResult:
     """Receive uploaded BOM files and delegate to the service layer.
@@ -84,4 +93,6 @@ async def upload_bom(
         development_level=development_level,
         uploaded_by=uploaded_by,
         notes=notes,
+        project_id=project_id,
+        actor=actor,
     )

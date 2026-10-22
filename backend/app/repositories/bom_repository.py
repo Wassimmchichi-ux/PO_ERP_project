@@ -33,7 +33,7 @@ def _get_system_user(db: Session) -> uuid.UUID:
             full_name="System User",
             registration_number="SYSTEM",
             password_hash="dummy",
-            role="SUPERADMIN"
+            role="ADMIN"
         )
         db.add(user)
         db.flush()
@@ -66,21 +66,22 @@ def _get_or_create_material_type(db: Session, name: str = 'Default', unit: str =
 def _material_type_for_bom_line(db: Session, part_type: Optional[str], unit: Optional[str]) -> int:
     normalized = (part_type or '').strip().upper()
     if normalized == 'M':
-        return _get_or_create_material_type(db, 'M', 'sqm')
+        return _get_or_create_material_type(db, 'M', unit or 'm')
     if normalized == 'S':
         return _get_or_create_material_type(db, 'S', 'pcs')
     return _get_or_create_material_type(db, normalized or 'Default', unit or 'pcs')
 
 
-def find_fgpn_by_code(db: Session, fgpn_code: str) -> FGPN:
+def find_fgpn_by_code(db: Session, fgpn_code: str, *, project_id: int | None = None) -> FGPN:
     """Find an existing FGPN by its part number code.
 
     Raises:
         ValidationException: If no FGPN with the given code exists.
     """
-    fgpns = db.execute(
-        select(FGPN).where(FGPN.fgpn_code == fgpn_code)
-    ).scalars().all()
+    stmt = select(FGPN).where(FGPN.fgpn_code == fgpn_code)
+    if project_id is not None:
+        stmt = stmt.where(FGPN.project_id == project_id)
+    fgpns = db.execute(stmt).scalars().all()
 
     if not fgpns:
         raise ValidationException(
@@ -91,11 +92,11 @@ def find_fgpn_by_code(db: Session, fgpn_code: str) -> FGPN:
     if len(fgpns) > 1:
         raise ValidationException(
             f"More than one FGPN found with part number '{fgpn_code}'. "
-            "FGPN is now scoped by PO, so upload must identify the target PO before saving this BOM.",
+            "FGPN is scoped by project, so upload must identify the target project before saving this BOM.",
             details={
                 "fgpn_code": fgpn_code,
                 "matches": [
-                    {"fgpn_id": item.fgpn_id, "po_id": item.po_id, "project_id": item.project_id}
+                    {"fgpn_id": item.fgpn_id, "project_id": item.project_id}
                     for item in fgpns
                 ],
             },
@@ -128,6 +129,7 @@ def save_bom_version(
     fgpn: FGPN,
     version: int,
     source_filename: str,
+    commit: bool = True,
 ) -> BOM:
     """Create a new BOM version for the given FGPN.
 
@@ -137,7 +139,7 @@ def save_bom_version(
     3. Demotes any existing is_current BOMs for this FGPN.
     4. Creates the BOM record.
     5. Creates all BOMLine records.
-    6. Commits the transaction.
+    6. Commits the transaction unless the upload service owns the transaction.
     7. Returns the refreshed BOM with its lines loaded.
     """
     # Check collision
@@ -222,12 +224,15 @@ def save_bom_version(
             quantity_tpdm=line.quantity_tpdm,
             cover_description=line.cover_description,
             total_quantity=line.total_quantity,
-            total_sqm=line.total_sqm
+            total_sqm=line.total_sqm,
+            source_unit=line.unit,
         )
         db.add(bom_line)
 
-    # Commit changes to persist all rows
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
 
     # Refresh the bom instance and expire relationship cache to force reload
     db.refresh(bom)

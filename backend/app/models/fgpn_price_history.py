@@ -21,8 +21,8 @@ class FGPNPriceHistory(Base):
         ForeignKey("FGPN.fgpn_id", deferrable=True, initially="IMMEDIATE"),
         nullable=False,
     )
-    old_price: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
-    new_price: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    old_price: Mapped[Decimal] = mapped_column(Numeric(14, 5), nullable=False)
+    new_price: Mapped[Decimal] = mapped_column(Numeric(14, 5), nullable=False)
     effective_date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     changed_by: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

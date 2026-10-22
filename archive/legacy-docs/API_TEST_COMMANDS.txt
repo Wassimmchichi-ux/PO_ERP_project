@@ -1,3 +1,7 @@
+HISTORICAL COMMAND REFERENCE
+These commands describe an earlier workspace layout and are not the current setup guide.
+Use docs/TECHNICAL_DOCUMENTATION.md for current paths, prerequisites, and verification results.
+
 API TEST COMMANDS
 =================
 

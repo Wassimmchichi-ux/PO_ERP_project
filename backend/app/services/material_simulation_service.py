@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import date
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
 from app.exceptions.base import ConflictException, NotFoundException, ValidationException
+from app.policies import PolicyActor, policy_engine, system_actor
 from app.repositories import simulation_repository, stock_repository
 from app.schemas.simulation import (
     SimulationPreviewRequest, 
@@ -96,6 +98,7 @@ def _build_pools(
     stock_scope_mode: str = "ALL",
     stock_owner_user_id: uuid.UUID | None = None,
     include_global_stock: bool = False,
+    target_date: date | None = None,
 ) -> dict[str, MaterialPool]:
     """Build material pools by querying physical stock units."""
     assigned_only = stock_scope_mode == "OWNED_ONLY"
@@ -124,12 +127,15 @@ def _build_pools(
             transit_units = stock_repository.get_positive_stock_units_by_status(
                 db,
                 'IN_TRANSIT',
+                target_date=target_date,
                 assigned_user_id=stock_owner_user_id,
                 assigned_only=True,
                 include_global_stock=include_global_stock,
             )
         else:
-            transit_units = stock_repository.get_positive_stock_units_by_status(db, 'IN_TRANSIT')
+            transit_units = stock_repository.get_positive_stock_units_by_status(
+                db, 'IN_TRANSIT', target_date=target_date,
+            )
         
     pools = {}
     for mat, mtype in materials:
@@ -193,8 +199,18 @@ def _build_pools(
     return pools
 
 
-def preview_simulation(db: Session, request: SimulationPreviewRequest) -> SimulationPreviewResult:
+def preview_simulation(
+    db: Session,
+    request: SimulationPreviewRequest,
+    *,
+    actor: PolicyActor | None = None,
+) -> SimulationPreviewResult:
     """Run a read-only simulation."""
+    policy_engine.require(actor or system_actor(), "simulation.run")
+
+    if request.include_in_transit and request.target_date is None:
+        raise ValidationException("target_date is required when including in-transit stock.")
+
     if not request.fgpns:
         raise ValidationException("At least one FGPN is required for simulation.")
     stock_scope_mode = _normalize_stock_scope_mode(request.stock_scope_mode)
@@ -300,9 +316,10 @@ def preview_simulation(db: Session, request: SimulationPreviewRequest) -> Simula
             stock_scope_mode=stock_scope_mode,
             stock_owner_user_id=request.stock_owner_user_id,
             include_global_stock=request.include_global_stock,
+            target_date=request.target_date,
         )
     else:
-        pools = _build_pools(db, request.include_in_transit)
+        pools = _build_pools(db, request.include_in_transit, target_date=request.target_date)
     
     # 3. Run Allocator
     demands, allocations = run_allocation_engine(demands, pools, request.allocation_strategy)
@@ -312,12 +329,13 @@ def preview_simulation(db: Session, request: SimulationPreviewRequest) -> Simula
     if stock_scope_mode == "OWNED_ONLY":
         in_transit_stock = stock_repository.get_in_transit_stock_by_material(
             db,
+            target_date=request.target_date,
             assigned_user_id=request.stock_owner_user_id,
             assigned_only=True,
             include_global_stock=request.include_global_stock,
         )
     else:
-        in_transit_stock = stock_repository.get_in_transit_stock_by_material(db)
+        in_transit_stock = stock_repository.get_in_transit_stock_by_material(db, target_date=request.target_date)
     
     # Aggregate material summaries
     mat_summaries = {}
@@ -437,6 +455,7 @@ def preview_simulation(db: Session, request: SimulationPreviewRequest) -> Simula
     total_launchable = sum((d.launchable_quantity for d in demands), Decimal('0'))
         
     return SimulationPreviewResult(
+        target_date=request.target_date,
         stock_scope='INCLUDING_IN_TRANSIT' if request.include_in_transit else 'CURRENT_STOCK',
         stock_scope_mode=stock_scope_mode,
         stock_owner_user_id=request.stock_owner_user_id if stock_scope_mode == "OWNED_ONLY" else None,
@@ -452,15 +471,27 @@ def preview_simulation(db: Session, request: SimulationPreviewRequest) -> Simula
     )
 
 
-def save_simulation(db: Session, request: SimulationSaveRequest, user_id: str) -> SimulationSaveResponse:
+def save_simulation(
+    db: Session,
+    request: SimulationSaveRequest,
+    user_id: str,
+    *,
+    actor: PolicyActor | None = None,
+) -> SimulationSaveResponse:
     """Run preview and save the result."""
+    acting_actor = actor or system_actor()
+    policy_engine.require(acting_actor, "simulation.run")
+
     # Enforce limit of 100 simulations per user
     user_uuid = uuid.UUID(user_id) if isinstance(user_id, str) else user_id
     current_count = simulation_repository.count_user_simulations(db, user_uuid)
     if current_count >= 100:
         raise ValidationException("You have reached the limit of 100 saved simulations. Please delete some before saving a new one.")
         
-    preview = preview_simulation(db, request.preview_request)
+    if request.preview_request.target_date not in (None, request.target_date):
+        raise ValidationException("Preview and save target dates must match.")
+    preview_request = request.preview_request.model_copy(update={"target_date": request.target_date})
+    preview = preview_simulation(db, preview_request, actor=acting_actor)
     
     # Extract shortfalls
     shortfalls = {}
@@ -527,6 +558,7 @@ def _saved_simulation_preview_request(
         ],
         allocation_strategy=simulation.allocation_strategy,
         include_in_transit=simulation.simulation_mode == 'INCLUDING_IN_TRANSIT',
+        target_date=simulation.target_date,
         safety_coefficient=simulation.safety_coefficient,
         stock_scope_mode=simulation.stock_scope_mode,
         stock_owner_user_id=simulation.stock_owner_user_id,
@@ -559,7 +591,9 @@ def _launch_allocations_from_saved_simulation(simulation_allocations) -> list[di
     ]
 
 
-def _find_unavailable_saved_allocations(db: Session, simulation_allocations) -> list[LaunchAvailabilityIssue]:
+def _find_unavailable_saved_allocations(
+    db: Session, simulation_allocations, *, target_date: date,
+) -> list[LaunchAvailabilityIssue]:
     stock_units = stock_repository.get_stock_units_by_ids(
         db,
         [alloc.stock_unit_id for alloc in simulation_allocations],
@@ -578,20 +612,36 @@ def _find_unavailable_saved_allocations(db: Session, simulation_allocations) -> 
             ))
             continue
 
+        reason = None
         if not stock_repository.is_stock_unit_available_for_quantity(stock_unit, alloc.allocated_quantity):
+            reason = "Stock unit was already consumed, moved, or no longer has enough quantity."
+        elif stock_unit.status == 'IN_TRANSIT' and (
+            stock_unit.expected_arrival_date is None
+            or stock_unit.expected_arrival_date.date() > target_date
+        ):
+            reason = "In-transit stock has no confirmed arrival on or before the simulation target date."
+        if reason:
             issues.append(LaunchAvailabilityIssue(
                 stock_unit_id=stock_unit.stock_unit_id,
                 material_part_number=stock_unit.material_part_number,
                 requested_quantity=alloc.allocated_quantity,
                 available_quantity=stock_unit.quantity,
                 current_status=stock_unit.status,
-                reason="Stock unit was already consumed, moved, or no longer has enough quantity.",
+                reason=reason,
             ))
     return issues
 
 
-def review_simulation_for_launch(db: Session, simulation_id: int) -> LaunchReviewResult:
+def review_simulation_for_launch(
+    db: Session,
+    simulation_id: int,
+    *,
+    actor: PolicyActor | None = None,
+) -> LaunchReviewResult:
     """Review whether a saved simulation can still become a launch."""
+    acting_actor = actor or system_actor()
+    policy_engine.require(acting_actor, "simulation.view")
+
     simulation = simulation_repository.get_simulation(db, simulation_id)
     if simulation is None:
         raise NotFoundException(f"Simulation {simulation_id} not found.")
@@ -601,7 +651,7 @@ def review_simulation_for_launch(db: Session, simulation_id: int) -> LaunchRevie
         simulation_id,
         allocation_type='SIMULATION',
     )
-    issues = _find_unavailable_saved_allocations(db, simulation_allocations)
+    issues = _find_unavailable_saved_allocations(db, simulation_allocations, target_date=simulation.target_date)
     if not issues:
         return LaunchReviewResult(
             simulation_id=simulation_id,
@@ -614,6 +664,7 @@ def review_simulation_for_launch(db: Session, simulation_id: int) -> LaunchRevie
     replacement_preview = preview_simulation(
         db,
         _saved_simulation_preview_request(simulation, selected_fgpns),
+        actor=acting_actor,
     )
     if replacement_preview.is_feasible:
         return LaunchReviewResult(
@@ -637,9 +688,17 @@ def review_simulation_for_launch(db: Session, simulation_id: int) -> LaunchRevie
     )
 
 
-def launch_saved_simulation(db: Session, simulation_id: int) -> LaunchSimulationResponse:
+def launch_saved_simulation(
+    db: Session,
+    simulation_id: int,
+    *,
+    actor: PolicyActor | None = None,
+) -> LaunchSimulationResponse:
     """Confirm a saved simulation as a launch and issue stock to production."""
-    review = review_simulation_for_launch(db, simulation_id)
+    acting_actor = actor or system_actor()
+    policy_engine.require(acting_actor, "launch.manage")
+
+    review = review_simulation_for_launch(db, simulation_id, actor=acting_actor)
     if not review.can_launch:
         raise ConflictException(
             "Cannot launch: saved stock units are unavailable and replacement stock cannot satisfy the launch.",

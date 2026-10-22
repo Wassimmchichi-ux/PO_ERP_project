@@ -13,9 +13,9 @@ inspect, version, and persist.
 
 The Finished-Good Part Number (FGPN) is **read from the workbook itself** —
 specifically the ``COVER PN (TPDM)`` column in the ``Source DATA`` sheet.
-The parser asserts that all data rows carry a consistent single FGPN and
-raises :class:`~app.exceptions.base.ValidationException` if more than one
-distinct value is found.
+Use :func:`parse_bom_workbook_many` for ERP uploads that may contain several
+finished goods in one workbook. Use :func:`parse_bom_workbook` when a caller
+expects the legacy single-FGPN contract.
 """
 from __future__ import annotations
 
@@ -61,6 +61,10 @@ _HEADER_ALIASES: dict[str, str] = {
     "total_quantity": "total qty",
     "unit": "UNIT",
     "total_sqm": "Total sqm",
+}
+
+_HEADER_ALIAS_VARIANTS: dict[str, tuple[str, ...]] = {
+    "total_sqm": ("Total sqm", "Total m", "Total meter", "Total meters"),
 }
 
 #: A header row is only accepted when it contains **all** of these fields.
@@ -144,12 +148,12 @@ def parse_bom_workbook(
 ) -> ParsedBom:
     """Parse a BOM XLSX workbook and return a structured :class:`ParsedBom`.
 
-    This function is the **sole public entry-point** of this module.  It:
+    This function preserves the legacy one-FGPN contract. It:
 
     1. Validates the bytes form a valid XLSX archive.
     2. Locates the ``Source DATA`` sheet.
     3. Discovers the FGPN from the ``COVER PN (TPDM)`` column.
-    4. Asserts exactly one distinct FGPN is present (one finished good per file).
+    4. Asserts exactly one distinct FGPN is present.
     5. Extracts all material lines that belong to that FGPN.
     6. Validates numeric fields are non-negative.
 
@@ -163,8 +167,37 @@ def parse_bom_workbook(
     Raises:
         ValidationException: If the file is not a valid XLSX, the
             ``Source DATA`` sheet is missing, the required headers are absent,
-            no data rows are found, or more than one distinct FGPN is present
-            (each uploaded file must correspond to exactly one finished good).
+            no data rows are found, or more than one distinct FGPN is present.
+    """
+    parsed_boms = parse_bom_workbook_many(
+        workbook_bytes,
+        source_filename=source_filename,
+    )
+    if len(parsed_boms) > 1:
+        raise ValidationException(
+            "The workbook contains more than one Finished-Good Part Number. "
+            "Use the multi-BOM upload flow to import this workbook.",
+            details={
+                "filename": source_filename,
+                "discovered_part_numbers": sorted(
+                    bom.finished_good_part_number for bom in parsed_boms
+                ),
+            },
+        )
+    return parsed_boms[0]
+
+
+def parse_bom_workbook_many(
+    workbook_bytes: bytes,
+    *,
+    source_filename: str,
+) -> list[ParsedBom]:
+    """Parse one workbook into one or more BOM snapshots.
+
+    A single ERP upload request may contain many workbooks, and each workbook
+    may contain rows for many FGPNs. The service layer persists one version per
+    discovered FGPN, giving the upload a many-to-many shape without putting
+    client-specific mapping rules in endpoints.
     """
     filename = _clean_required(source_filename, "source_filename")
 
@@ -192,42 +225,36 @@ def parse_bom_workbook(
             details={"filename": filename},
         )
 
-    if len(discovered_fgpns) > 1:
-        raise ValidationException(
-            "The workbook contains more than one Finished-Good Part Number. "
-            "Each uploaded file must correspond to exactly one finished good.",
-            details={
-                "filename": filename,
-                "discovered_part_numbers": sorted(discovered_fgpns),
-            },
+    parsed_boms: list[ParsedBom] = []
+    for finished_good_part_number in sorted(discovered_fgpns):
+        extracted_lines = _extract_material_lines(
+            rows, header_row_number, header_map, finished_good_part_number
         )
 
-    finished_good_part_number = next(iter(discovered_fgpns))
+        if not extracted_lines:
+            raise ValidationException(
+                "No BOM material rows were found for the discovered part number.",
+                details={"finished_good_part_number": finished_good_part_number},
+            )
 
-    extracted_lines = _extract_material_lines(
-        rows, header_row_number, header_map, finished_good_part_number
-    )
-
-    if not extracted_lines:
-        raise ValidationException(
-            "No BOM material rows were found for the discovered part number.",
-            details={"finished_good_part_number": finished_good_part_number},
+        first_raw_row = extracted_lines[0].raw_row
+        finished_good_description = first_raw_row.get(
+            _HEADER_ALIASES["finished_good_description"]
         )
 
-    first_raw_row = extracted_lines[0].raw_row
-    finished_good_description = first_raw_row.get(
-        _HEADER_ALIASES["finished_good_description"]
-    )
+        parsed_boms.append(
+            ParsedBom(
+                finished_good_part_number=finished_good_part_number,
+                finished_good_description=_clean_optional(finished_good_description),
+                source_filename=filename,
+                source_reported_by=_clean_optional(source_reported_by),
+                source_report_date=source_report_date,
+                source_report_time=source_report_time,
+                lines=extracted_lines,
+            )
+        )
 
-    return ParsedBom(
-        finished_good_part_number=finished_good_part_number,
-        finished_good_description=_clean_optional(finished_good_description),
-        source_filename=filename,
-        source_reported_by=_clean_optional(source_reported_by),
-        source_report_date=source_report_date,
-        source_report_time=source_report_time,
-        lines=extracted_lines,
-    )
+    return parsed_boms
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +359,9 @@ def _find_header_row(
     normalized_aliases = {
         _normalize_header(header): field for field, header in _HEADER_ALIASES.items()
     }
+    for field, aliases in _HEADER_ALIAS_VARIANTS.items():
+        for alias in aliases:
+            normalized_aliases[_normalize_header(alias)] = field
     for row_number, row in rows.items():
         header_map: dict[str, int] = {}
         for column_index, value in row.items():

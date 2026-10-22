@@ -75,11 +75,11 @@ def test_simulation_demand_calculation(monkeypatch):
     )
     
     # Mock build_pools to return empty pools
-    monkeypatch.setattr(sim_svc, '_build_pools', lambda db, inc: {})
+    monkeypatch.setattr(sim_svc, '_build_pools', lambda db, inc, **kwargs: {})
     # Mock stock repository to avoid DB calls
     import app.repositories.stock_repository as stock_repo
     monkeypatch.setattr(stock_repo, 'get_all_materials', lambda db: [])
-    monkeypatch.setattr(stock_repo, 'get_in_transit_stock_by_material', lambda db: {})
+    monkeypatch.setattr(stock_repo, 'get_in_transit_stock_by_material', lambda db, **kwargs: {})
     
     # 3. Create Request
     req = SimulationPreviewRequest(
@@ -169,7 +169,7 @@ def test_selected_fgpn_priority_reports_launchable_quantities(monkeypatch):
     monkeypatch.setattr(
         sim_svc,
         '_build_pools',
-        lambda db, inc: {
+        lambda db, inc, **kwargs: {
             "MAT-1": MaterialPool(
                 material_part_number="MAT-1",
                 warehouse_slots=[StockSlot(1, 'WAREHOUSE', Decimal('150'))],
@@ -192,7 +192,7 @@ def test_selected_fgpn_priority_reports_launchable_quantities(monkeypatch):
             )
         ],
     )
-    monkeypatch.setattr(stock_repo, 'get_in_transit_stock_by_material', lambda db: {})
+    monkeypatch.setattr(stock_repo, 'get_in_transit_stock_by_material', lambda db, **kwargs: {})
 
     req = SimulationPreviewRequest(
         fgpns=[
@@ -270,7 +270,7 @@ def test_build_pools_marks_roll_slots_as_whole_issue(monkeypatch):
     monkeypatch.setattr(
         stock_repo,
         'get_positive_stock_units_by_status',
-        lambda db, status: warehouse_units if status == 'WAREHOUSE' else transit_units,
+        lambda db, status, **kwargs: warehouse_units if status == 'WAREHOUSE' else transit_units,
     )
     monkeypatch.setattr(stock_repo, 'get_production_stock_by_material', lambda db: {})
     monkeypatch.setattr(stock_repo, 'get_cutting_consumption_by_material', lambda db: {})

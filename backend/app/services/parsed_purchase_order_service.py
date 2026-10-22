@@ -6,11 +6,15 @@ import re
 import uuid
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from io import BytesIO
 from typing import Any
 
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 from sqlalchemy.orm import Session
 
 from app.exceptions.base import NotFoundException, ValidationException
+from app.policies import PolicyActor, policy_engine, system_actor
 from app.repositories import parsed_purchase_order_repository
 from app.schemas.parsed_purchase_order import (
     ParsedPurchaseOrderCorrectionResponse,
@@ -25,7 +29,10 @@ from app.schemas.parsed_purchase_order import (
 _PATH_TOKEN_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?")
 _REQUIRED_HEADER_FIELDS = ("po_number", "version", "lines")
 _REQUIRED_LINE_FIELDS = ("line_no", "part_number", "quantity", "unit_price", "total", "due_date")
-_PO_NUMBER_RE = re.compile(r"\b(?:PO|P\.O\.|purchase\s+order)\s*(?:number|no\.?|#|:)?\s*([A-Z]{0,3}-?\d{4,10})\b", re.I)
+_PO_NUMBER_RE = re.compile(
+    r"\b(?:purchase\s+order|P\.O\.|PO)\s*(?:number|no\.?|#)?\s*:?\s*((?:[A-Z]{1,3}-?)?\d{4,10})\b",
+    re.I,
+)
 _DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4})\b")
 _MONEY_RE = re.compile(r"[-+]?\d+(?:[.,]\d{1,4})?")
 _LINE_RE = re.compile(
@@ -38,13 +45,27 @@ _LINE_RE = re.compile(
     r"(?:\s+(?P<due_date>\d{4}-\d{2}-\d{2}|\d{2}[/-]\d{2}[/-]\d{4}))?\s*$",
     re.I,
 )
+_ADIENT_HEADER_RE = re.compile(r"\bNO\s*:\s*(\d{4,12})\s+Version\s*:\s*(\d+)\b", re.I)
+_MONTH_DATE_PATTERN = r"[A-Za-z]{3}\s+\d{1,2},\s+\d{4}"
+_ADIENT_LINE_RE = re.compile(
+    r"^(?P<line_no>\d{5})\s+(?P<plant>\d+)\s+"
+    r"(?:(?P<invoice_not_required>X|Yes|No)\s+)?"
+    rf"(?P<due_date>{_MONTH_DATE_PATTERN})\s+"
+    r"(?P<material_group>\d+)\s+(?P<quantity>\d[\d.,]*)\s+"
+    r"(?P<uom>[A-Z]+)\s+(?P<unit_price>\d[\d.,]*)\s+(?P<total>\d[\d.,]*)$",
+    re.I,
+)
+_ADIENT_PART_RE = re.compile(r"^(?P<part_number>\d{6,8}-[A-Z0-9]{4}-[A-Z0-9]{2,3})\s+(?P<description>.+)$", re.I)
 
 
 def create_parsed_purchase_order(
     db: Session,
     request: ParsedPurchaseOrderCreateRequest,
     user_id: str | uuid.UUID,
+    actor: PolicyActor | None = None,
 ) -> ParsedPurchaseOrderResponse:
+    policy_engine.require(actor or system_actor(), "po.parse")
+
     user_uuid = _normalize_user_id(user_id)
     _validate_payload_is_po_like(request.parsed_payload)
 
@@ -68,23 +89,21 @@ def parse_purchase_order_bytes(
     source_file_name: str | None,
     content: bytes,
     user_id: str | uuid.UUID,
+    actor: PolicyActor | None = None,
 ) -> ParsedPurchaseOrderResponse:
-    """Parse a simple text-extractable PO and store it as a review draft.
-
-    This intentionally favors predictable, explainable extraction over OCR or
-    vendor-specific magic. Scanned PDFs should still be converted by the
-    professor parser or an OCR step before upload.
-    """
+    """Parse text-layer Adient PDFs or simple tabular text into a review draft."""
+    policy_engine.require(actor or system_actor(), "po.parse")
     payload = _parse_simple_purchase_order_payload(content)
     return create_parsed_purchase_order(
         db,
         ParsedPurchaseOrderCreateRequest(
             source_file_name=source_file_name,
-            parser_name="simple-regex-po-parser",
-            parser_version="2026-09-02",
+            parser_name="adient-po-parser" if payload.get("source_format") == "ADIENT_PO" else "simple-regex-po-parser",
+            parser_version="2026-10-22",
             parsed_payload=payload,
         ),
         user_id,
+        actor=actor,
     )
 
 
@@ -98,7 +117,10 @@ def save_parsed_purchase_order_corrections(
     parsed_po_id: int,
     request: ParsedPurchaseOrderCorrectionsRequest,
     user_id: str | uuid.UUID,
+    actor: PolicyActor | None = None,
 ) -> ParsedPurchaseOrderResponse:
+    policy_engine.require(actor or system_actor(), "po.update")
+
     parsed_po = _get_required_parsed_po(db, parsed_po_id)
     user_uuid = _normalize_user_id(user_id)
     effective_payload = _effective_payload(parsed_po.parsed_payload, parsed_po.corrections)
@@ -138,7 +160,13 @@ def save_parsed_purchase_order_corrections(
     return _to_response(parsed_po)
 
 
-def validate_parsed_purchase_order(db: Session, parsed_po_id: int) -> ParsedPurchaseOrderValidationResult:
+def validate_parsed_purchase_order(
+    db: Session,
+    parsed_po_id: int,
+    actor: PolicyActor | None = None,
+) -> ParsedPurchaseOrderValidationResult:
+    policy_engine.require(actor or system_actor(), "po.update")
+
     parsed_po = _get_required_parsed_po(db, parsed_po_id)
     payload = _effective_payload(parsed_po.parsed_payload, parsed_po.corrections)
     errors, warnings = _validate_effective_payload(payload)
@@ -166,7 +194,10 @@ def import_parsed_purchase_order(
     parsed_po_id: int,
     request: ParsedPurchaseOrderImportRequest,
     user_id: str | uuid.UUID,
+    actor: PolicyActor | None = None,
 ) -> ParsedPurchaseOrderImportResult:
+    policy_engine.require(actor or system_actor(), "po.import")
+
     parsed_po = _get_required_parsed_po(db, parsed_po_id)
     payload = _effective_payload(parsed_po.parsed_payload, parsed_po.corrections)
     errors, _warnings = _validate_effective_payload(payload)
@@ -250,6 +281,9 @@ def _parse_simple_purchase_order_payload(content: bytes) -> dict[str, Any]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     compact = "\n".join(lines)
 
+    if _ADIENT_HEADER_RE.search(compact):
+        return _parse_adient_purchase_order_payload(lines, compact)
+
     po_match = _PO_NUMBER_RE.search(compact)
     all_dates = [_normalize_date(match.group(1)) for match in _DATE_RE.finditer(compact)]
     parsed_lines = []
@@ -290,7 +324,114 @@ def _parse_simple_purchase_order_payload(content: bytes) -> dict[str, Any]:
     }
 
 
+def _parse_adient_purchase_order_payload(lines: list[str], text: str) -> dict[str, Any]:
+    """Associate each item table row with its following part block, across pages.
+
+    The six-digit material-group column is not the FGPN. The FGPN is printed
+    below the row and can move to the following page together with its customer
+    references. Keep missing/unrecognized fields visible for review.
+    """
+    headers = _ADIENT_HEADER_RE.findall(text)
+    po_number, version = headers[0]
+    errors: list[str] = []
+    if len(set(headers)) != 1:
+        errors.append("The PDF contains conflicting purchase-order numbers or versions.")
+
+    parsed_lines: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for raw_line in lines:
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        row = _ADIENT_LINE_RE.fullmatch(line)
+        if row:
+            values = row.groupdict()
+            current = {
+                "line_no": values["line_no"],
+                "plant": values["plant"],
+                "material_group": values["material_group"],
+                "invoice_not_required": values["invoice_not_required"],
+                "part_number": "",
+                "description": "",
+                "quantity": _normalize_number(values["quantity"]),
+                "uom": values["uom"].upper(),
+                "unit_price": _normalize_number(values["unit_price"]),
+                "total": _normalize_number(values["total"]),
+                "due_date": _normalize_date(values["due_date"]),
+                "customer_part_ref": "",
+                "customer_references": [],
+            }
+            parsed_lines.append(current)
+            continue
+        if re.match(r"^\d{5}\s+\d+\s", line):
+            errors.append(f"Could not read item row {line.split()[0]}; review the source PDF.")
+            current = None
+            continue
+        part = _ADIENT_PART_RE.fullmatch(line)
+        if part and current is not None:
+            if current["part_number"]:
+                errors.append(f"Item {current['line_no']} has more than one part-number block.")
+            else:
+                current.update(part.groupdict())
+            continue
+        if current is not None and current["part_number"] and "||" in line:
+            references = line.split("||", 1)[1].removesuffix("-HC:")
+            current["customer_references"] = [value.strip() for value in references.split("|") if value.strip()]
+            current["customer_part_ref"] = "|".join(current["customer_references"])
+
+    def header_date(label: str) -> str:
+        match = re.search(rf"{label}\s*:\s*({_MONTH_DATE_PATTERN})", text, re.I)
+        return _normalize_date(match.group(1)) if match else ""
+
+    def total_field(label: str) -> tuple[str | None, str | None]:
+        match = re.search(rf"{label}\s+([A-Z]{{3}})(?:[ \t]+([\d.,]+))?", text)
+        return (match.group(1), _normalize_number(match.group(2)) if match.group(2) else None) if match else (None, None)
+
+    currency, stated_total = total_field("Line Total")
+    _, tax_total = total_field("Tax Total")
+    _, currency_total = total_field("Currency Total")
+    computed_total = sum((Decimal(item["total"]) for item in parsed_lines), Decimal("0"))
+    supplier_number = re.search(r"Supplier No\s*:\s*(\d+)", text)
+    replacement = re.search(r"This PO will replace\s+(\d+)", text, re.I)
+    due_dates = sorted({item["due_date"] for item in parsed_lines})
+    return {
+        "source_format": "ADIENT_PO",
+        "contact_email": "",
+        "po_number": po_number,
+        "version": int(version),
+        "order_date": header_date("Order Date"),
+        "document_date": header_date("Order Date"),
+        "change_date": header_date("Change Date"),
+        "delivery_date": due_dates[-1] if due_dates else "",
+        "supplier_number": supplier_number.group(1) if supplier_number else None,
+        "replaced_po_number": replacement.group(1) if replacement else None,
+        "currency": currency,
+        "line_count": len(parsed_lines),
+        "lines": parsed_lines,
+        "computed_total": str(computed_total.quantize(Decimal("0.01"))),
+        "stated_total": stated_total,
+        "tax_total": tax_total,
+        "currency_total": currency_total,
+        "totals_match": stated_total is not None and computed_total == Decimal(stated_total),
+        "extraction_errors": errors,
+        "raw_text_preview": text[:2000],
+    }
+
+
 def _decode_document_text(content: bytes) -> str:
+    if content.lstrip().startswith(b"%PDF"):
+        try:
+            reader = PdfReader(BytesIO(content))
+            if reader.is_encrypted and reader.decrypt("") == 0:
+                raise ValidationException("Password-protected PDFs must be unlocked before upload.")
+            pdf_text = "\n".join(
+                page.extract_text(extraction_mode="layout", layout_mode_space_vertically=False) or ""
+                for page in reader.pages
+            )
+        except (PdfReadError, ValueError, KeyError) as exc:
+            raise ValidationException("Could not read the purchase-order PDF.") from exc
+        if not pdf_text.strip():
+            raise ValidationException("The PDF has no readable text layer. Apply OCR before upload.")
+        return pdf_text
+
     for encoding in ("utf-8", "latin-1"):
         try:
             return content.decode(encoding)
@@ -300,14 +441,18 @@ def _decode_document_text(content: bytes) -> str:
 
 
 def _normalize_number(value: str) -> str:
-    return value.replace(",", ".")
+    # Adient uses a decimal comma and a period for thousands (1.160,64000).
+    value = value.replace("\u00a0", "").replace(" ", "")
+    if "," in value:
+        return value.replace(".", "").replace(",", ".")
+    return value
 
 
 def _normalize_date(value: str) -> str:
     if not value:
         return ""
     value = value.replace("/", "-")
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y"):
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%b %d, %Y"):
         try:
             return datetime.strptime(value, fmt).date().isoformat()
         except ValueError:
@@ -326,7 +471,7 @@ def _extract_stated_total(text: str) -> str | None:
 
 
 def _validate_effective_payload(payload: dict[str, Any]) -> tuple[list[str], list[str]]:
-    errors: list[str] = []
+    errors: list[str] = [str(error) for error in payload.get("extraction_errors", [])]
     warnings: list[str] = []
 
     for field in _REQUIRED_HEADER_FIELDS:
@@ -343,6 +488,7 @@ def _validate_effective_payload(payload: dict[str, Any]) -> tuple[list[str], lis
         warnings.append("line_count does not match the number of parsed lines.")
 
     distinct_part_numbers: set[str] = set()
+    line_numbers: set[Decimal] = set()
     computed_total = Decimal("0")
 
     for index, line in enumerate(lines):
@@ -361,6 +507,18 @@ def _validate_effective_payload(payload: dict[str, Any]) -> tuple[list[str], lis
         quantity = _decimal_or_none(line.get("quantity"))
         unit_price = _decimal_or_none(line.get("unit_price"))
         total = _decimal_or_none(line.get("total"))
+
+        line_no = _decimal_or_none(line.get("line_no"))
+        if line_no is None or line_no <= 0 or line_no != line_no.to_integral_value():
+            errors.append(f"Line {index + 1} has invalid line_no.")
+        elif line_no in line_numbers:
+            errors.append(f"Line {index + 1} repeats line_no {line.get('line_no')}.")
+        else:
+            line_numbers.add(line_no)
+        try:
+            datetime.strptime(str(line.get("due_date")), "%Y-%m-%d")
+        except ValueError:
+            errors.append(f"Line {index + 1} has invalid due_date.")
 
         if quantity is None or quantity <= 0:
             errors.append(f"Line {index + 1} has invalid quantity.")
@@ -444,7 +602,8 @@ def _decimal_or_none(value: Any) -> Decimal | None:
     if value in (None, ""):
         return None
     try:
-        return Decimal(str(value))
+        number = Decimal(str(value))
+        return number if number.is_finite() else None
     except (InvalidOperation, ValueError):
         return None
 

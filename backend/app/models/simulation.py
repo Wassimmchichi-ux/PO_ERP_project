@@ -21,6 +21,12 @@ class Simulation(Base):
         nullable=False,
         comment="CURRENT_STOCK, INCLUDING_IN_TRANSIT",
     )
+    allocation_strategy: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        server_default="PRIORITY",
+        comment="PRIORITY, MANUAL, PRIORITY_PLUS_MANUAL",
+    )
     stock_scope_mode: Mapped[str] = mapped_column(
         String(30),
         nullable=False,

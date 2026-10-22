@@ -195,7 +195,7 @@ def import_effective_purchase_order(
         po_id=po.po_id,
         version_number=version_number,
         document_id=po_document_id,
-        document_date=_date_or_none(effective_payload.get("order_date")),
+        document_date=_date_or_none(effective_payload.get("order_date") or effective_payload.get("document_date")),
         created_at=now,
         created_by=imported_by,
         change_reason=change_reason,

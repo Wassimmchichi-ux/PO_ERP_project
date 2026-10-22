@@ -1,91 +1,42 @@
-# Launch PO System — Backend
+# Adient ERP Backend
 
-Backend foundation for the Purchase Order / Material Planning / Stock /
-Delivery / Finance system. Built with FastAPI, SQLAlchemy 2.0, and
-Alembic, using a layered architecture designed to port cleanly to
-Spring Boot later:
+FastAPI, SQLAlchemy, and PostgreSQL services for purchase orders, BOMs, material simulation, stock, cutting reports, projects, administration, handover, and customer delivery.
 
-```
-API (routes)  →  Services  →  Repositories  →  SQLAlchemy Models  →  PostgreSQL
-```
+## Documentation
 
-- Routes only receive/validate requests and call services. No business logic.
-- Services own business logic and orchestrate repositories.
-- Repositories are the only layer that talks to the database.
+- [Business workflows](../docs/BUSINESS_DOCUMENTATION.md)
+- [Technical implementation and document formats](../docs/TECHNICAL_DOCUMENTATION.md)
+- [Remaining technical and business issues](../docs/ISSUES_REGISTER.md)
 
-## Status
+## Local development
 
-This is the **M0 milestone**: project skeleton only. No ERP entities
-(Purchase Orders, Projects, Materials, etc.) are implemented yet —
-those arrive in later milestones per the agreed roadmap.
+Use Python 3.13 and install `requirements.txt` in a virtual environment. Configure `DATABASE_URL`, `SECRET_KEY`, and `ALLOWED_ORIGINS` using `.env.example`; preserve any existing local settings. Native database credentials must match the actual server. Compose's `db` hostname is for container networking.
 
-## Project layout
-
-```
-backend/
-├── app/
-│   ├── api/            # FastAPI routers (controllers)
-│   ├── core/            # Settings, logging — cross-cutting config
-│   ├── db/               # Engine, session factory, declarative Base + mixins
-│   ├── models/           # SQLAlchemy ORM models (empty until M1+)
-│   ├── repositories/     # DB access layer (empty until M1+)
-│   ├── services/         # Business logic (empty until M1+)
-│   ├── schemas/          # Pydantic request/response DTOs (empty until M1+)
-│   ├── exceptions/        # Custom exceptions + global handlers
-│   ├── dependencies/      # FastAPI dependency providers (e.g. get_db)
-│   ├── middleware/        # Request logging, etc.
-│   └── main.py            # App factory / entry point
-├── migrations/            # Alembic migrations
-├── tests/
-├── requirements.txt
-├── .env.example
-└── alembic.ini
-```
-
-## Setup
+From this directory:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# edit .env with your local DATABASE_URL and a real SECRET_KEY
+DEBUG=false .venv/bin/python -m app.db.bootstrap
+DEBUG=false .venv/bin/python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Requires a running PostgreSQL instance matching `DATABASE_URL`.
+Native API reference: http://localhost:8000/docs. Docker exposes the API at http://localhost:8080/docs and the frontend at http://localhost:5173. `/health` is a liveness check, not a database readiness check.
 
-## Running
+## Database and source documents
+
+`app/db/bootstrap.py` creates empty PostgreSQL schemas from the active ORM metadata and stamps the current Alembic head, or upgrades existing versioned schemas. `alembic.ini` selects `migrations/`. The separate `alembic/`, `app/models/domain.py`, and SQL dump are historical representations.
+
+The [setup guide](../docs/TECHNICAL_DOCUMENTATION.md#23-database-initialization-and-document-test-data) documents explicit reset/seeding of disposable test data. Normal startup does neither. The current head is `e0f4a6b8c123`.
+
+The current PDFs preserve five-decimal prices, XLSX BOM uploads retain source units and commit atomically, and cutting XLSX reports preserve original bytes before explicit consumption posting. Source files live under `../ressources/business-test/`. Tests read those actual files.
+
+## Structure and checks
+
+Routes are in `app/api`, business workflows in `app/services`, persistence in `app/repositories`, mappings in `app/models`, contracts in `app/schemas`, and prototype authorization in `app/policies`. Some services query the ORM directly. BOM uploads defer repository commit to the complete upload transaction.
 
 ```bash
-uvicorn app.main:app --reload
+PYTHONDONTWRITEBYTECODE=1 DEBUG=false .venv/bin/python -m pytest -q -p no:cacheprovider
 ```
 
-Then check:
+On 22 October 2026: **91 passed**. PostgreSQL upgrade, fresh schema/reset, source-document seed, and local API checks also passed. [Verification details](../docs/TECHNICAL_DOCUMENTATION.md#9-verification-performed) state the scope and limits.
 
-```bash
-curl http://localhost:8000/health
-# {"status": "healthy"}
-```
-
-## Testing
-
-```bash
-pytest
-```
-
-## Migrations
-
-No tables exist yet (no ERP models). Once the first models land:
-
-```bash
-alembic revision --autogenerate -m "add <entity>"
-alembic upgrade head
-```
-
-## Configuration
-
-All environment variables are documented in `.env.example`. Settings
-are loaded and validated once at startup via `app/core/config.py` —
-the app will refuse to start if a required variable is missing or
-malformed, rather than failing later at an unpredictable point.
+Authentication remains a prototype header mechanism. Simulation saving does not reserve stock, and material issue does not create the complete downstream launch records. These and the unmatched source identifiers are recorded in the issues register.
