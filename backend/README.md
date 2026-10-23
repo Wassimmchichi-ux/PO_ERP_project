@@ -25,7 +25,7 @@ Native API reference: http://localhost:8000/docs. Docker exposes the API at http
 
 `app/db/bootstrap.py` creates empty PostgreSQL schemas from the active ORM metadata and stamps the current Alembic head, or upgrades existing versioned schemas. `alembic.ini` selects `migrations/`. The separate `alembic/`, `app/models/domain.py`, and SQL dump are historical representations.
 
-The [setup guide](../docs/TECHNICAL_DOCUMENTATION.md#23-database-initialization-and-document-test-data) documents explicit reset/seeding of disposable test data. Normal startup does neither. The current head is `e0f4a6b8c123`.
+The [setup guide](../docs/TECHNICAL_DOCUMENTATION.md#2-local-deployment) documents the local runtime. Normal startup does not reset data. The current head is `e9a1c4f6b802`. For disposable development data, `python -m app.db.bootstrap --seed-demo-workflows` idempotently adds a supplier transit order and a manual warehouse reception without resetting the database.
 
 The current PDFs preserve five-decimal prices, XLSX BOM uploads retain source units and commit atomically, and cutting XLSX reports preserve original bytes before explicit consumption posting. Source files live under `../ressources/business-test/`. Tests read those actual files.
 
@@ -37,6 +37,6 @@ Routes are in `app/api`, business workflows in `app/services`, persistence in `a
 PYTHONDONTWRITEBYTECODE=1 DEBUG=false .venv/bin/python -m pytest -q -p no:cacheprovider
 ```
 
-On 22 October 2026: **91 passed**. PostgreSQL upgrade, fresh schema/reset, source-document seed, and local API checks also passed. [Verification details](../docs/TECHNICAL_DOCUMENTATION.md#9-verification-performed) state the scope and limits.
+On 23 October 2026, the suite contains **99 tests**: 97 non-HTTP tests pass in the restricted runner, and its worker-thread limitation prevents the two in-process HTTP tests from completing. Live Docker checks confirm supplier orders and transit return matching source and quantity fields; they also cover stock summary, reception history, and the baseline ledger. The PostgreSQL upgrade, frontend type checking/lint/build, source-document checks, and focused eight-test supplier/warehouse workflow suite also pass. [Verification details](../docs/TECHNICAL_DOCUMENTATION.md#10-verification) state the scope and limits.
 
-Authentication remains a prototype header mechanism. Simulation saving does not reserve stock, and material issue does not create the complete downstream launch records. These and the unmatched source identifiers are recorded in the issues register.
+Authentication remains a prototype header mechanism. Simulations reserve physical stock and launch retries are idempotent, but material issue does not create the complete downstream launch records. This and the unmatched source identifiers are recorded in the issues register.

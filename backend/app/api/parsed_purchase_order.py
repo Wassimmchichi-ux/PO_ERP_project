@@ -6,6 +6,7 @@ from json import JSONDecodeError
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, UploadFile, status
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.dependencies.auth import actor_user_id_or_system, get_current_policy_actor
@@ -84,13 +85,34 @@ async def parse_purchase_order_upload(
     actor: Annotated[PolicyActor, Depends(get_current_policy_actor)],
 ) -> ParsedPurchaseOrderResponse:
     """Run the simple built-in PO parser and store the output for review."""
+    content = await file.read(20 * 1024 * 1024 + 1)
+    if len(content) > 20 * 1024 * 1024:
+        raise ValidationException("Purchase-order source exceeds the 20 MB limit.")
     user_id = actor_user_id_or_system(db, actor)
     return parsed_purchase_order_service.parse_purchase_order_bytes(
         db,
         source_file_name=file.filename,
-        content=await file.read(),
+        content=content,
         user_id=user_id,
         actor=actor,
+    )
+
+
+@router.get("/{parsed_po_id}/source")
+def download_parsed_purchase_order_source(
+    parsed_po_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    actor: Annotated[PolicyActor, Depends(get_current_policy_actor)],
+) -> Response:
+    """Download the exact source uploaded for this parsing draft."""
+    content, media_type, filename = parsed_purchase_order_service.get_parsed_purchase_order_source(
+        db, parsed_po_id, actor=actor,
+    )
+    safe_filename = filename.replace('"', "").replace("\r", "").replace("\n", "")
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
     )
 
 

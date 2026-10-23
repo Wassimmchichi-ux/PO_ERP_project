@@ -63,6 +63,8 @@ def create_parsed_purchase_order(
     request: ParsedPurchaseOrderCreateRequest,
     user_id: str | uuid.UUID,
     actor: PolicyActor | None = None,
+    source_content: bytes | None = None,
+    source_content_type: str | None = None,
 ) -> ParsedPurchaseOrderResponse:
     policy_engine.require(actor or system_actor(), "po.parse")
 
@@ -73,6 +75,8 @@ def create_parsed_purchase_order(
         db,
         document_id=request.document_id,
         source_file_name=request.source_file_name,
+        source_content=source_content,
+        source_content_type=source_content_type,
         parser_name=request.parser_name,
         parser_version=request.parser_version,
         parsed_payload=request.parsed_payload,
@@ -104,6 +108,24 @@ def parse_purchase_order_bytes(
         ),
         user_id,
         actor=actor,
+        source_content=content,
+        source_content_type="application/pdf" if content.lstrip().startswith(b"%PDF") else "text/plain",
+    )
+
+
+def get_parsed_purchase_order_source(
+    db: Session,
+    parsed_po_id: int,
+    actor: PolicyActor | None = None,
+) -> tuple[bytes, str, str]:
+    policy_engine.require(actor or system_actor(), "po.parse")
+    parsed_po = _get_required_parsed_po(db, parsed_po_id)
+    if parsed_po.source_content is None:
+        raise NotFoundException(f"Parsed purchase order {parsed_po_id} has no retained source file.")
+    return (
+        parsed_po.source_content,
+        parsed_po.source_content_type or "application/octet-stream",
+        parsed_po.source_file_name or f"purchase-order-{parsed_po_id}.pdf",
     )
 
 
@@ -241,6 +263,7 @@ def _to_response(parsed_po) -> ParsedPurchaseOrderResponse:
         parsed_po_id=parsed_po.parsed_po_id,
         document_id=parsed_po.document_id,
         source_file_name=parsed_po.source_file_name,
+        has_source_file=parsed_po.source_content is not None,
         parser_name=parsed_po.parser_name,
         parser_version=parsed_po.parser_version,
         status=parsed_po.status,

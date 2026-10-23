@@ -14,7 +14,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.db.base import Base
 from app.exceptions.base import ConflictException, ForbiddenException, NotFoundException, ValidationException
-from app.models import Material, MaterialType, StockUnit, User
+from app.models import Material, MaterialType, Project, StockUnit, User
 from app.models.audit_log import AuditLog
 from app.policies import PolicyActor
 from app.repositories import simulation_repository, stock_repository
@@ -40,6 +40,8 @@ def db():
             is_locked=False, must_change_password=False, created_at=datetime(2026, 11, 1)))
         session.add(MaterialType(material_type_id=1, name="S", unit="pcs"))
         session.add(Material(material_part_number="MAT-1", description="Component", material_type_id=1, unit_price=Decimal("1")))
+        session.add(Project(project_id=1, project_code="P-TEST", name="Test", launch_engineer_user_id=ENGINEER_ID,
+            status="Active", created_at=datetime(2026, 11, 1), updated_at=datetime(2026, 11, 1)))
         session.commit()
         yield session
     engine.dispose()
@@ -54,8 +56,9 @@ def add_stock(db, quantity, *, status="IN_TRANSIT", eta=None, owner=None):
 
 
 def request(**changes):
-    values = dict(fgpns=[FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=20)],
-        allocation_strategy="PRIORITY", safety_coefficient=Decimal("1"), include_in_transit=True, target_date=TARGET)
+    values = dict(project_id=1,
+        fgpns=[FgpnSimulationRequest(po_id=1, fgpn_id=1, priority=1, requested_quantity=20)],
+        safety_coefficient=Decimal("1"), include_in_transit=True, target_date=TARGET)
     values.update(changes)
     return SimulationPreviewRequest(**values)
 
@@ -63,24 +66,23 @@ def request(**changes):
 @pytest.fixture()
 def demand(monkeypatch):
     bom = SimpleNamespace(lines=[SimpleNamespace(material_part_number="MAT-1", part_type="S", total_quantity=Decimal("1"))])
-    line = SimpleNamespace(po_line_id=1, fgpn_id=1, ordered_quantity=Decimal("20"),
-        po_version=SimpleNamespace(purchase_order=SimpleNamespace(po_id=1, po_number="PO-TEST")))
+    line = SimpleNamespace(po_line_id=1, po_version_id=1, fgpn_id=1, ordered_quantity=Decimal("20"),
+        po_version=SimpleNamespace(purchase_order=SimpleNamespace(po_id=1, po_number="PO-TEST", current_version_id=1)))
     monkeypatch.setattr(simulation_repository, "get_current_boms_for_fgpns", lambda *args: {1: bom})
-    monkeypatch.setattr(simulation_repository, "get_fgpns", lambda *args: {1: SimpleNamespace(fgpn_code="FG-TEST")})
+    monkeypatch.setattr(simulation_repository, "get_fgpns", lambda *args: {1: SimpleNamespace(fgpn_code="FG-TEST", project_id=1)})
     monkeypatch.setattr(simulation_repository, "get_po_lines", lambda *args: {})
     monkeypatch.setattr(simulation_repository, "get_current_po_lines_for_po_fgpns", lambda *args: {(1, 1): line})
 
 
-@pytest.mark.parametrize("strategy", ["PRIORITY", "MANUAL", "PRIORITY_PLUS_MANUAL"])
 @pytest.mark.parametrize("split", [True, False])
-def test_production_before_warehouse_and_transit(strategy, split):
+def test_production_before_warehouse_and_transit(split):
     pool = MaterialPool(material_part_number="MAT-1",
         production_slots=[StockSlot(None, "PRODUCTION", Decimal("5"))],
         warehouse_slots=[StockSlot(1, "WAREHOUSE", Decimal("8"), can_split=split)],
         in_transit_slots=[StockSlot(2, "IN_TRANSIT", Decimal("10"), can_split=split)])
     row = FgpnDemand(1, "FG", 1, Decimal("15"), Decimal("15"))
     row.material_demands["MAT-1"] = Decimal("15")
-    _, allocations = run_allocation_engine([row], {"MAT-1": pool}, strategy)
+    _, allocations = run_allocation_engine([row], {"MAT-1": pool})
     assert [(slot.source, qty) for _, slot, qty in allocations] == [
         ("PRODUCTION", Decimal("5")), ("WAREHOUSE", Decimal("8")),
         ("IN_TRANSIT", Decimal("2") if split else Decimal("10"))]
@@ -230,6 +232,7 @@ def test_save_uses_top_level_target_date_and_rejects_mismatch(db, demand, monkey
         saved.update(kwargs)
         return 123
     monkeypatch.setattr(simulation_repository, "save_simulation", capture)
+    monkeypatch.setattr(simulation_repository, "get_simulation", lambda *args: SimpleNamespace(workflow_status="READY", document_due_at=None))
     simulations.save_simulation(db, SimulationSaveRequest(preview_request=request(target_date=None),
         target_date=TARGET, mtg_minutes_document_id=1), ENGINEER_ID, actor=ENGINEER)
     assert saved["target_date"] == TARGET
@@ -242,15 +245,17 @@ def test_save_uses_top_level_target_date_and_rejects_mismatch(db, demand, monkey
 @pytest.mark.parametrize("replacement", [False, True])
 def test_supplier_delay_revalidates_saved_launch_at_original_target(db, demand, monkeypatch, replacement):
     stock = add_stock(db, 20, eta=datetime(2026, 11, 10))
-    simulation = SimpleNamespace(simulation_id=1, target_date=TARGET, allocation_strategy="PRIORITY",
+    simulation = SimpleNamespace(simulation_id=1, project_id=1, target_date=TARGET,
         simulation_mode="INCLUDING_IN_TRANSIT", safety_coefficient=Decimal("1"),
-        stock_scope_mode="ALL", stock_owner_user_id=None, include_global_stock=False)
-    allocation = SimpleNamespace(stock_unit_id=stock.stock_unit_id, allocated_quantity=Decimal("20"))
-    selection = SimpleNamespace(po_id=1, fgpn_id=1, po_line_id=None, simulation_quantity=Decimal("20"))
+        stock_scope_mode="ALL", stock_owner_user_id=None, include_global_stock=False,
+        workflow_status="READY", document_due_at=None)
+    allocation = SimpleNamespace(stock_unit_id=stock.stock_unit_id, allocated_quantity=Decimal("20"),
+        source_location="IN_TRANSIT", status="RESERVED", is_whole_issue=False)
+    selection = SimpleNamespace(po_id=1, fgpn_id=1, po_line_id=None, priority=1, simulation_quantity=Decimal("20"))
     monkeypatch.setattr(simulation_repository, "get_simulation", lambda *args: simulation)
     monkeypatch.setattr(simulation_repository, "get_simulation_allocations", lambda *args, **kwargs: [allocation])
     monkeypatch.setattr(simulation_repository, "get_simulation_selected_fgpns", lambda *args: [selection])
-    assert simulations.review_simulation_for_launch(db, 1, actor=ENGINEER).can_launch
+    assert not simulations.review_simulation_for_launch(db, 1, actor=ENGINEER).can_launch
     update_expected_arrival(db, stock.stock_unit_id,
         ExpectedArrivalUpdateRequest(expected_arrival_date=date(2026, 11, 12), reason="Transport delay"), ENGINEER_ID, actor=ENGINEER)
     if replacement:
@@ -259,6 +264,3 @@ def test_supplier_delay_revalidates_saved_launch_at_original_target(db, demand, 
     assert review.can_launch is replacement and review.original_allocations_available is False
     assert review.replacement_preview.target_date == TARGET
     assert review.replacement_preview.material_summaries[0].in_transit == Decimal("0")
-    if not replacement:
-        with pytest.raises(ConflictException):
-            simulations.launch_saved_simulation(db, 1, actor=PolicyActor(user_id=ENGINEER_ID, role="LAUNCH_MANAGER"))

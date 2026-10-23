@@ -22,6 +22,8 @@ from app.models import (
     Project,
     PurchaseOrder,
     PurchaseOrderLine,
+    Supplier,
+    SupplierMaterialOrder,
     User,
 )
 from app.repositories.bom_repository import _get_system_user
@@ -130,6 +132,7 @@ def list_reference_items(db: Session) -> ReferenceListsResponse:
     items.extend(_receiver_items(db))
     items.extend(_delivery_method_items(db))
     items.extend(_material_type_items(db))
+    items.extend(_supplier_items(db))
     return ReferenceListsResponse(items=items, total=len(items))
 
 
@@ -193,6 +196,22 @@ def create_reference_item(
         db.add(model)
         db.flush()
         item = _fgpn_response(db, model)
+    elif list_name == "suppliers":
+        reference = (request.code or request.detail or "").strip()
+        if not reference:
+            raise ValidationException("Supplier reference is required.")
+        if db.scalar(select(Supplier.supplier_id).where(Supplier.supplier_reference == reference)):
+            raise ConflictException(f"Supplier reference {reference} already exists.")
+        model = Supplier(
+            supplier_reference=reference,
+            full_name=value,
+            status="Active",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(model)
+        db.flush()
+        item = _supplier_response(db, model)
     else:
         raise ValidationException(f"Unsupported reference list {list_name}.")
 
@@ -260,6 +279,26 @@ def update_reference_item(
             model.status = _status(request.active)
         model.updated_at = dt.datetime.now()
         item = _fgpn_response(db, model)
+    elif list_name == "suppliers":
+        model = _get_or_404(db, Supplier, item_id)
+        if request.value is not None:
+            model.full_name = request.value.strip()
+        if request.code is not None or request.detail is not None:
+            reference = (request.code or request.detail or "").strip()
+            if not reference:
+                raise ValidationException("Supplier reference is required.")
+            duplicate = db.scalar(
+                select(Supplier.supplier_id)
+                .where(Supplier.supplier_reference == reference)
+                .where(Supplier.supplier_id != model.supplier_id)
+            )
+            if duplicate is not None:
+                raise ConflictException(f"Supplier reference {reference} already exists.")
+            model.supplier_reference = reference
+        if request.active is not None:
+            model.status = _status(request.active)
+        model.updated_at = dt.datetime.now()
+        item = _supplier_response(db, model)
     else:
         raise ValidationException(f"Unsupported reference list {list_name}.")
 
@@ -347,6 +386,13 @@ def _material_type_items(db: Session) -> list[ReferenceItemResponse]:
     return [_material_type_response(db, item) for item in db.execute(select(MaterialType).order_by(MaterialType.name)).scalars()]
 
 
+def _supplier_items(db: Session) -> list[ReferenceItemResponse]:
+    return [
+        _supplier_response(db, item)
+        for item in db.execute(select(Supplier).order_by(Supplier.full_name)).scalars()
+    ]
+
+
 def _customer_response(db: Session, item: Customer) -> ReferenceItemResponse:
     return ReferenceItemResponse(
         id=f"customers:{item.customer_id}",
@@ -416,6 +462,17 @@ def _material_type_response(db: Session, item: MaterialType) -> ReferenceItemRes
         detail=item.unit,
         active=_is_active(item.status),
         linked_records=_count(db, Material.material_type_id == item.material_type_id),
+    )
+
+
+def _supplier_response(db: Session, item: Supplier) -> ReferenceItemResponse:
+    return ReferenceItemResponse(
+        id=f"suppliers:{item.supplier_id}",
+        list="Suppliers",
+        value=item.full_name,
+        detail=item.supplier_reference,
+        active=_is_active(item.status),
+        linked_records=_count(db, SupplierMaterialOrder.supplier_id == item.supplier_id),
     )
 
 

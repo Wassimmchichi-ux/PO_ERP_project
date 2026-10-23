@@ -14,6 +14,10 @@ from app.models.cutting_consumption import CuttingConsumption
 from app.models.material import Material
 from app.models.material_type import MaterialType
 from app.models.user import User
+from app.models.stock_allocation import StockAllocation
+from app.models.simulation import Simulation
+from app.models.supplier_material_order import SupplierMaterialOrder
+from app.models.supplier_material_order_line import SupplierMaterialOrderLine
 from app.policies.rules import is_assignable_stock_owner
 
 
@@ -100,6 +104,54 @@ def get_cutting_consumption_by_material(db: Session) -> dict[str, Decimal]:
     return {row.material_part_number: row.total_consumed for row in result}
 
 
+def get_cutting_consumption_by_stock_unit(db: Session) -> dict[int, Decimal]:
+    """Return posted CutMan usage keyed by the resolved business stock unit."""
+    stmt = (
+        select(
+            CuttingConsumption.stock_unit_id,
+            func.coalesce(func.sum(CuttingConsumption.quantity_consumed), 0),
+        )
+        .where(CuttingConsumption.stock_unit_id.is_not(None))
+        .group_by(CuttingConsumption.stock_unit_id)
+    )
+    return {stock_unit_id: quantity for stock_unit_id, quantity in db.execute(stmt).all()}
+
+
+def get_unassigned_cutting_consumption_by_material(db: Session) -> dict[str, Decimal]:
+    """Retain compatibility for historical consumption without a nesting identifier link."""
+    stmt = (
+        select(
+            CuttingConsumption.material_part_number,
+            func.coalesce(func.sum(CuttingConsumption.quantity_consumed), 0),
+        )
+        .where(CuttingConsumption.stock_unit_id.is_(None))
+        .group_by(CuttingConsumption.material_part_number)
+    )
+    return {part: quantity for part, quantity in db.execute(stmt).all()}
+
+
+def get_reserved_quantities_by_stock_unit(db: Session) -> dict[int, Decimal]:
+    """Return active saved-simulation reservations keyed by physical stock unit."""
+    stmt = (
+        select(
+            StockAllocation.stock_unit_id,
+            func.coalesce(func.sum(StockAllocation.allocated_quantity), 0),
+        )
+        .join(Simulation, Simulation.simulation_id == StockAllocation.simulation_id)
+        .where(StockAllocation.allocation_type == "SIMULATION")
+        .where(StockAllocation.status == "RESERVED")
+        .where(Simulation.workflow_status.in_(("AWAITING_DOCUMENT", "READY")))
+        .where(
+            or_(
+                Simulation.document_due_at.is_(None),
+                Simulation.document_due_at > datetime.now(),
+            )
+        )
+        .group_by(StockAllocation.stock_unit_id)
+    )
+    return {stock_unit_id: quantity for stock_unit_id, quantity in db.execute(stmt).all()}
+
+
 def get_all_materials(db: Session) -> list[tuple[Material, MaterialType]]:
     """Get all materials with their types for joining."""
     stmt = (
@@ -125,6 +177,7 @@ def get_positive_stock_units_by_status(
         .options(joinedload(StockUnit.user))
         .where(StockUnit.status == status)
         .where(StockUnit.quantity > 0)
+        .order_by(StockUnit.stock_unit_id)
     )
     if target_date is not None:
         stmt = stmt.where(func.date(StockUnit.expected_arrival_date) <= target_date)
@@ -139,17 +192,38 @@ def _filter_by_stock_owner_scope(stmt, assigned_user_id: uuid.UUID | None, inclu
     return stmt.where(StockUnit.user_id == assigned_user_id)
 
 
-def get_stock_units_by_ids(db: Session, stock_unit_ids: list[int]) -> dict[int, StockUnit]:
+def get_stock_units_by_ids(
+    db: Session,
+    stock_unit_ids: list[int],
+    *,
+    for_update: bool = False,
+) -> dict[int, StockUnit]:
     """Get stock units keyed by id."""
     if not stock_unit_ids:
         return {}
     stmt = (
         select(StockUnit)
-        .options(joinedload(StockUnit.user))
         .where(StockUnit.stock_unit_id.in_(stock_unit_ids))
+        .order_by(StockUnit.stock_unit_id)
     )
+    if for_update:
+        stmt = stmt.with_for_update()
+    else:
+        stmt = stmt.options(joinedload(StockUnit.user))
     units = db.execute(stmt).scalars().all()
     return {unit.stock_unit_id: unit for unit in units}
+
+
+def lock_stock_units_for_materials(db: Session, material_part_numbers: list[str]) -> None:
+    """Serialize reservations competing for any stock of the same materials."""
+    if not material_part_numbers:
+        return
+    db.execute(
+        select(StockUnit.stock_unit_id)
+        .where(StockUnit.material_part_number.in_(set(material_part_numbers)))
+        .order_by(StockUnit.stock_unit_id)
+        .with_for_update()
+    ).all()
 
 
 def get_user(db: Session, user_id: uuid.UUID) -> User | None:
@@ -171,10 +245,12 @@ def create_stock_unit_reception(
     expected_arrival_date: datetime | None,
     assigned_user_id: uuid.UUID | None,
     reception_user_id: uuid.UUID | None,
+    business_unit_id: str | None = None,
 ) -> StockUnit:
     """Create a stock unit received or recorded by warehouse."""
     now = datetime.now()
     stock_unit = StockUnit(
+        business_unit_id=business_unit_id,
         material_part_number=material_part_number,
         quantity=quantity,
         status=status,
@@ -286,13 +362,44 @@ def get_cutting_consumption_for_material(db: Session, material_part_number: str)
     return db.execute(stmt).scalar() or Decimal('0')
 
 
-def get_in_transit_stock_units(db: Session, from_date: Optional[date] = None, to_date: Optional[date] = None) -> list[tuple[StockUnit, Material, MaterialType]]:
-    """Get detailed in transit stock units with their materials."""
+def get_in_transit_stock_units(
+    db: Session,
+    from_date: Optional[date] = None,
+    to_date: Optional[date] = None,
+) -> list[
+    tuple[
+        StockUnit,
+        Material,
+        MaterialType,
+        SupplierMaterialOrderLine | None,
+        SupplierMaterialOrder | None,
+    ]
+]:
+    """Get detailed transit units and their optional supplier-order source."""
     stmt = (
-        select(StockUnit, Material, MaterialType)
-        .options(joinedload(StockUnit.user))
+        select(
+            StockUnit,
+            Material,
+            MaterialType,
+            SupplierMaterialOrderLine,
+            SupplierMaterialOrder,
+        )
+        .options(
+            joinedload(StockUnit.user),
+            joinedload(SupplierMaterialOrderLine.arrival_entered_by_user),
+            joinedload(SupplierMaterialOrder.project),
+        )
         .join(Material, StockUnit.material_part_number == Material.material_part_number)
         .join(MaterialType, Material.material_type_id == MaterialType.material_type_id)
+        .outerjoin(
+            SupplierMaterialOrderLine,
+            SupplierMaterialOrderLine.stock_unit_id == StockUnit.stock_unit_id,
+        )
+        .outerjoin(
+            SupplierMaterialOrder,
+            SupplierMaterialOrder.supplier_order_id
+            == SupplierMaterialOrderLine.supplier_order_id,
+        )
         .where(StockUnit.status == 'IN_TRANSIT')
     )
     
@@ -303,6 +410,23 @@ def get_in_transit_stock_units(db: Session, from_date: Optional[date] = None, to
         
     stmt = stmt.order_by(StockUnit.expected_arrival_date.asc().nulls_last())
     return db.execute(stmt).all()  # type: ignore
+
+
+def get_supplier_order_line_for_stock_unit(
+    db: Session,
+    stock_unit_id: int,
+) -> SupplierMaterialOrderLine | None:
+    """Return the supplier-order line that declared a stock unit, when applicable."""
+    return db.execute(
+        select(SupplierMaterialOrderLine)
+        .options(
+            joinedload(SupplierMaterialOrderLine.order).joinedload(
+                SupplierMaterialOrder.project
+            ),
+            joinedload(SupplierMaterialOrderLine.arrival_entered_by_user),
+        )
+        .where(SupplierMaterialOrderLine.stock_unit_id == stock_unit_id)
+    ).scalar_one_or_none()
 
 
 def count_distinct_materials_by_status(db: Session, status_list: list[str]) -> int:

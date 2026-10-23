@@ -22,6 +22,7 @@ from app.schemas.parsed_purchase_order import (
     ParsedPurchaseOrderImportRequest,
 )
 from app.services import parsed_purchase_order_service
+from app.services import purchase_order_service
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -242,6 +243,72 @@ def test_validated_parsed_po_import_creates_po_lines_and_fgpns(db_session: Sessi
     assert {fgpn.project_id for fgpn in fgpns} == {1}
 
 
+def test_imported_po_is_returned_by_purchase_order_register(db_session: Session) -> None:
+    """The register must query final PO tables, not parser staging records."""
+    payload = _sample_payload()
+    created = parsed_purchase_order_service.create_parsed_purchase_order(
+        db_session,
+        ParsedPurchaseOrderCreateRequest(parsed_payload=payload),
+        TEST_USER_ID,
+    )
+    imported = parsed_purchase_order_service.import_parsed_purchase_order(
+        db_session,
+        created.parsed_po_id,
+        ParsedPurchaseOrderImportRequest(
+            project_id=1,
+            customer_id=1,
+            contact_id=1,
+            delivery_method_id=1,
+        ),
+        TEST_USER_ID,
+    )
+
+    register = purchase_order_service.list_purchase_orders(db_session)
+
+    assert register.total == 1
+    item = register.items[0]
+    assert item.po_id == imported.po_id
+    assert item.po_number == payload["po_number"]
+    assert item.project_id == 1
+    assert item.current_version == payload["version"]
+    assert item.status == "Unplanned"
+    assert item.ordered_quantity == sum(
+        (Decimal(str(line["quantity"])) for line in payload["lines"]), Decimal("0")
+    )
+    assert item.delivered_quantity == Decimal("0")
+    assert item.remaining_quantity == item.ordered_quantity
+    assert item.fgpn_codes == sorted({line["part_number"] for line in payload["lines"]})
+
+
+def test_unlinked_imported_po_can_be_viewed_and_deleted(db_session: Session) -> None:
+    payload = _sample_payload()
+    created = parsed_purchase_order_service.create_parsed_purchase_order(
+        db_session,
+        ParsedPurchaseOrderCreateRequest(parsed_payload=payload),
+        TEST_USER_ID,
+    )
+    imported = parsed_purchase_order_service.import_parsed_purchase_order(
+        db_session,
+        created.parsed_po_id,
+        ParsedPurchaseOrderImportRequest(
+            project_id=1,
+            customer_id=1,
+            contact_id=1,
+            delivery_method_id=1,
+        ),
+        TEST_USER_ID,
+    )
+
+    detail = purchase_order_service.get_purchase_order(db_session, imported.po_id)
+    purchase_order_service.delete_purchase_order(db_session, imported.po_id)
+
+    assert detail.po_id == imported.po_id
+    assert detail.source_file_name == f"{payload['po_number']}.json"
+    assert len(detail.lines) == payload["line_count"]
+    assert db_session.get(PurchaseOrder, imported.po_id) is None
+    assert purchase_order_service.list_purchase_orders(db_session).total == 0
+
+
 def test_parsed_po_import_updates_fgpn_price_history_when_price_changes(db_session: Session) -> None:
     payload = _sample_payload()
     first_import = parsed_purchase_order_service.create_parsed_purchase_order(
@@ -305,6 +372,13 @@ def test_business_purchase_order_pdfs_parse_and_import(
     )
     payload = created.parsed_payload
     assert created.parser_name == "adient-po-parser"
+    assert created.has_source_file is True
+    source_content, source_type, source_name = parsed_purchase_order_service.get_parsed_purchase_order_source(
+        db_session, created.parsed_po_id,
+    )
+    assert source_content == path.read_bytes()
+    assert source_type == "application/pdf"
+    assert source_name == filename
     assert payload["po_number"] == number
     assert payload["version"] == 1
     assert payload["line_count"] == count
@@ -328,6 +402,7 @@ def test_business_purchase_order_pdfs_parse_and_import(
     version = db_session.get(PurchaseOrderVersion, result.po_version_id)
     lines = db_session.query(PurchaseOrderLine).filter_by(po_version_id=result.po_version_id).order_by(PurchaseOrderLine.line_number).all()
     assert version.document_date == date.fromisoformat(order_date)
+    assert version.document.file_path == f"/purchase-orders/parsed/{created.parsed_po_id}/source"
     assert len(lines) == count
     for source_line, stored_line in zip(payload["lines"], lines, strict=True):
         assert stored_line.fgpn.fgpn_code == source_line["part_number"]

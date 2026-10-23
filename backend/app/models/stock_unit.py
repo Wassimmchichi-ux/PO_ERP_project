@@ -25,6 +25,12 @@ class StockUnit(Base):
         Identity(),
         primary_key=True,
     )
+    business_unit_id: Mapped[str | None] = mapped_column(
+        String(100),
+        unique=True,
+        nullable=True,
+        comment="Operational stock-unit identifier; for CutMan this is the Original nesting name.",
+    )
     material_part_number: Mapped[str] = mapped_column(
         String(50),
         ForeignKey(

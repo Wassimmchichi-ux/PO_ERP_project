@@ -26,6 +26,11 @@ class CuttingConsumption(Base):
     )
     quantity_consumed: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
     nesting_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    stock_unit_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("StockUnit.stock_unit_id", deferrable=True),
+        nullable=True,
+    )
     cutman_document_id: Mapped[int] = mapped_column(
         Integer,
         ForeignKey("Document.document_id", deferrable=True, initially="IMMEDIATE"),
@@ -50,3 +55,4 @@ class CuttingConsumption(Base):
         "Document",
         foreign_keys=[cutman_document_id],
     )
+    stock_unit: Mapped["StockUnit | None"] = relationship("StockUnit")

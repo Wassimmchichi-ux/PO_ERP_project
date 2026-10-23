@@ -12,11 +12,20 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.exceptions.base import ConflictException, NotFoundException, ValidationException
-from app.models import AuditLog, CuttingConsumption, CuttingReportImport, Document, Launch, Material
+from app.models import (
+    AuditLog,
+    CuttingConsumption,
+    CuttingReportImport,
+    Document,
+    Launch,
+    Material,
+    StockUnit,
+)
 from app.policies import PolicyActor, policy_engine
 from app.repositories import stock_repository
 from app.schemas.cutting_report import CuttingReportPostRequest, CuttingReportResponse
 from app.utils.cutting_report_extractor import extract_cutting_report
+from app.services import stock_movement_service
 
 
 def _response(report: CuttingReportImport, *, duplicate=False) -> CuttingReportResponse:
@@ -80,19 +89,53 @@ def post_report(db: Session, report_id: int, request: CuttingReportPostRequest, 
 
     totals = defaultdict(Decimal)
     normalized_rows = []
-    unit_aliases = {"m": "m", "meter": "m", "meters": "m", "sqm": "sqm", "m2": "sqm", "pcs": "pcs", "ea": "pcs", "kg": "kg"}
+    unit_aliases = {"m": "m", "me": "m", "meter": "m", "meters": "m", "sqm": "m", "m2": "m", "pcs": "pcs", "ea": "pcs", "kg": "kg"}
+    nesting_names = []
     for row in report.source_rows:
         amount = Decimal(row["spreading_usage"]).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
         if amount <= 0 or amount > Decimal("999999.9999"):
             raise ValidationException(f"Row {row['row_number']}: usage is outside consumption precision/range.")
         totals[row["material_part_number"]] += amount
-        normalized_rows.append((row, amount))
+        nesting_name = (
+            row["raw_fields"].get("Original nesting name")
+            or request.stock_unit_ids_by_row.get(row["row_number"])
+            or ""
+        ).strip()
+        if not nesting_name:
+            raise ValidationException(
+                f"Row {row['row_number']}: Original nesting name is required as the stock-unit identifier."
+            )
+        nesting_names.append(nesting_name)
+        normalized_rows.append((row, amount, nesting_name))
     # Serialize imports affecting the same material and validate the complete
     # report before writing any consumption rows.
     materials = db.scalars(select(Material).where(Material.material_part_number.in_(sorted(totals))).order_by(Material.material_part_number).with_for_update()).all()
     material_map = {material.material_part_number: material for material in materials}
-    sent = stock_repository.get_production_stock_by_material(db)
-    consumed = stock_repository.get_cutting_consumption_by_material(db)
+    stock_units = db.scalars(
+        select(StockUnit)
+        .where(StockUnit.business_unit_id.in_(set(nesting_names)))
+        .with_for_update()
+    ).all()
+    units_by_business_id = {unit.business_unit_id: unit for unit in stock_units}
+    consumption_by_unit = stock_repository.get_cutting_consumption_by_stock_unit(db)
+    usage_by_unit = defaultdict(Decimal)
+    for row, amount, nesting_name in normalized_rows:
+        stock_unit = units_by_business_id.get(nesting_name)
+        if stock_unit is None:
+            raise ValidationException(
+                f"Row {row['row_number']}: stock unit '{nesting_name}' was not found."
+            )
+        if stock_unit.status != "PRODUCTION":
+            raise ValidationException(
+                f"Row {row['row_number']}: stock unit '{nesting_name}' is not in PRODUCTION."
+            )
+        if stock_unit.material_part_number != row["material_part_number"]:
+            raise ValidationException(
+                f"Row {row['row_number']}: stock unit '{nesting_name}' belongs to material "
+                f"{stock_unit.material_part_number}, not {row['material_part_number']}."
+            )
+        usage_by_unit[stock_unit.stock_unit_id] += amount
+
     for part, amount in totals.items():
         material = material_map.get(part)
         if material is None:
@@ -100,9 +143,17 @@ def post_report(db: Session, report_id: int, request: CuttingReportPostRequest, 
         stored_unit = unit_aliases.get(material.material_type.unit.strip().lower())
         if stored_unit != request.usage_unit:
             raise ValidationException(f"Material {part} has unit {material.material_type.unit}; it does not match confirmed usage unit {request.usage_unit}.")
-        remaining = max(Decimal("0"), sent.get(part, Decimal("0")) - consumed.get(part, Decimal("0")))
+    for stock_unit_id, amount in usage_by_unit.items():
+        stock_unit = next(unit for unit in stock_units if unit.stock_unit_id == stock_unit_id)
+        remaining = max(
+            Decimal("0"),
+            stock_unit.quantity - consumption_by_unit.get(stock_unit_id, Decimal("0")),
+        )
         if amount > remaining:
-            raise ValidationException(f"Reported usage {amount} for {part} exceeds remaining received production stock {remaining}. Reconcile receipts/units before posting.")
+            raise ValidationException(
+                f"Reported usage {amount} for stock unit {stock_unit.business_unit_id} exceeds "
+                f"its remaining production quantity {remaining}."
+            )
 
     now = datetime.now()
     document = Document(document_type="CUTMAN_REPORT", file_name=report.file_name,
@@ -111,11 +162,26 @@ def post_report(db: Session, report_id: int, request: CuttingReportPostRequest, 
     db.add(document)
     try:
         db.flush()
-        for row, amount in normalized_rows:
+        for row, amount, nesting_name in normalized_rows:
+            stock_unit = units_by_business_id[nesting_name]
             db.add(CuttingConsumption(launch_id=request.launch_id, material_part_number=row["material_part_number"],
-                quantity_consumed=amount, nesting_name=(row["raw_fields"].get("Produced nesting name") or row["raw_fields"].get("Original nesting name") or None),
+                quantity_consumed=amount, nesting_name=nesting_name, stock_unit_id=stock_unit.stock_unit_id,
                 cutman_document_id=document.document_id, consumed_at=datetime.fromisoformat(row["started_at"]),
                 source_report_id=report.report_id, source_row_number=row["row_number"], source_event_fingerprint=row["fingerprint"]))
+            stock_movement_service.record_movement(
+                db,
+                material_part_number=row["material_part_number"],
+                movement_type="CUTMAN_CONSUMPTION",
+                quantity_change=-amount,
+                actor_user_id=user_id,
+                stock_unit_id=stock_unit.stock_unit_id,
+                stock_unit_reference=stock_unit.business_unit_id,
+                from_status="PRODUCTION",
+                to_status="PRODUCTION",
+                source_reference=report.file_name,
+                note=f"CutMan report {report.report_id}, row {row['row_number']}.",
+                occurred_at=datetime.fromisoformat(row["started_at"]),
+            )
         report.posted_launch_id = request.launch_id
         report.posted_by = user_id
         report.posted_at = now

@@ -1,36 +1,30 @@
 """Pydantic schemas for Simulation workflows."""
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 import uuid
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class FgpnSimulationRequest(BaseModel):
     po_id: int
     fgpn_id: int
     po_line_id: Optional[int] = None
-    priority: Optional[int] = None
+    priority: int = Field(gt=0)
     requested_quantity: Decimal = Field(gt=0)
-    manual_quantity: Optional[Decimal] = Field(default=None, gt=0)
 
 
 class SimulationPreviewRequest(BaseModel):
-    project_id: Optional[int] = None
+    project_id: int
     fgpns: list[FgpnSimulationRequest] = Field(min_length=1)
-    
-    allocation_strategy: str = Field(
-        ..., 
-        description="PRIORITY, MANUAL, or PRIORITY_PLUS_MANUAL"
-    )
     include_in_transit: bool = False
     target_date: Optional[date] = Field(
         default=None,
         description="Required when including in-transit stock; only arrivals on or before this date qualify.",
     )
-    safety_coefficient: Decimal = Field(default=Decimal('2.0'), gt=0)
-    stock_scope_mode: str = Field(
+    safety_coefficient: Decimal = Field(default=Decimal('2.0'), ge=1)
+    stock_scope_mode: Literal["ALL", "OWNED_ONLY"] = Field(
         default="ALL",
         description="ALL or OWNED_ONLY. OWNED_ONLY filters physical stock units by stock_owner_user_id.",
     )
@@ -40,9 +34,29 @@ class SimulationPreviewRequest(BaseModel):
         description="When stock_scope_mode is OWNED_ONLY, also include global stock units with no assigned owner.",
     )
 
+    @model_validator(mode="after")
+    def validate_ordered_selections(self) -> "SimulationPreviewRequest":
+        priorities = [item.priority for item in self.fgpns]
+        expected = list(range(1, len(self.fgpns) + 1))
+        if sorted(priorities) != expected:
+            raise ValueError("FGPN priorities must be unique and contiguous from 1 to the number of selections.")
+
+        selection_keys = [
+            (item.po_id, item.po_line_id if item.po_line_id is not None else item.fgpn_id)
+            for item in self.fgpns
+        ]
+        if len(selection_keys) != len(set(selection_keys)):
+            raise ValueError("Each PO line/FGPN may be selected only once per simulation.")
+
+        for item in self.fgpns:
+            if item.requested_quantity != item.requested_quantity.to_integral_value():
+                raise ValueError("Finished-good simulation quantities must be whole pieces.")
+        return self
+
 
 class AllocationDetail(BaseModel):
     stock_unit_id: Optional[int]  # None for virtual remaining production pool
+    business_unit_id: Optional[str] = None
     material_part_number: str
     source: str  # WAREHOUSE, PRODUCTION, IN_TRANSIT
     assigned_user_id: Optional[uuid.UUID] = None
@@ -96,7 +110,6 @@ class SimulationPreviewResult(BaseModel):
     stock_scope_mode: str = "ALL"
     stock_owner_user_id: Optional[uuid.UUID] = None
     include_global_stock: bool = False
-    allocation_strategy: str
     is_feasible: bool
     total_requested_quantity: Decimal
     total_launchable_quantity: Decimal
@@ -106,15 +119,43 @@ class SimulationPreviewResult(BaseModel):
     allocation_details: list[AllocationDetail]
 
 
+class SimulationOptionLine(BaseModel):
+    po_id: int
+    po_number: str
+    po_line_id: int
+    fgpn_id: int
+    fgpn_code: str
+    description: Optional[str] = None
+    ordered_quantity: Decimal
+    already_planned_quantity: Decimal
+    outstanding_quantity: Decimal
+
+
+class SimulationOptionsResponse(BaseModel):
+    project_id: int
+    lines: list[SimulationOptionLine]
+
+
 class SimulationSaveRequest(BaseModel):
     preview_request: SimulationPreviewRequest
     target_date: date
-    mtg_minutes_document_id: int
+    mtg_minutes_document_id: Optional[int] = None
 
 
 class SimulationSaveResponse(BaseModel):
     simulation_id: int
-    status: str = "SAVED"
+    status: str
+    document_due_at: Optional[datetime] = None
+
+
+class SimulationDocumentRequest(BaseModel):
+    mtg_minutes_document_id: int
+
+
+class SimulationWorkflowResponse(BaseModel):
+    simulation_id: int
+    status: str
+    document_due_at: Optional[datetime] = None
 
 
 class LaunchAvailabilityIssue(BaseModel):
@@ -141,3 +182,4 @@ class LaunchSimulationResponse(BaseModel):
     status: str
     reallocated: bool = False
     launch_allocation_count: int
+    idempotent_replay: bool = False

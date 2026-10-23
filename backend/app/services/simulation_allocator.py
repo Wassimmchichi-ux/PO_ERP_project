@@ -2,7 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR
 import uuid
 from typing import Optional
 
@@ -13,6 +13,7 @@ class StockSlot:
     stock_unit_id: Optional[int]
     source: str  # WAREHOUSE, PRODUCTION, IN_TRANSIT
     quantity: Decimal
+    business_unit_id: Optional[str] = None
     material_type: Optional[str] = None
     can_split: bool = True
     available: bool = True
@@ -219,118 +220,72 @@ def _choose_whole_slots(slots: list[StockSlot], demand: Decimal) -> list[StockSl
 def run_allocation_engine(
     fgpn_demands: list[FgpnDemand],
     material_pools: dict[str, MaterialPool],
-    allocation_strategy: str
 ) -> tuple[list[FgpnDemand], list[tuple[str, StockSlot, Decimal]]]:
-    """Orchestrates the allocation across all FGPNs according to the strategy."""
-    
-    all_allocations = []  # (fgpn_code, StockSlot, allocated_qty)
+    """Allocate an ordered multi-PO plan and optimize physical units globally.
 
-    if allocation_strategy in ('PRIORITY', 'PRIORITY_PLUS_MANUAL'):
-        # Process sequentially by priority
-        # Sort ASC: 1 is highest priority
-        fgpn_demands.sort(key=lambda f: (f.priority, f.request_sequence, f.fgpn_id))
-        
-        for fgpn in fgpn_demands:
-            if fgpn.requested_quantity <= 0:
+    The ordered FGPN rows are the only planning mode. Each row already contains
+    the engineer's editable quantity. Finished-good coverage is lexicographic:
+    priority 1 receives the largest whole-piece quantity it can launch, then
+    priority 2 uses the remaining material, and so on.
+
+    Physical units are selected once per material for the combined covered
+    demand. This prevents one FGPN from consuming whole rolls that could cover
+    several selected POs together. ``allocate_material`` preserves the source
+    order and performs exact minimum-over-issue subset selection for bounded
+    whole-roll sets.
+    """
+    fgpn_demands.sort(key=lambda f: (f.priority, f.request_sequence, f.fgpn_id))
+    logical_remaining = {
+        mpn: pool.total_available() for mpn, pool in material_pools.items()
+    }
+
+    for fgpn in fgpn_demands:
+        per_piece: dict[str, Decimal] = {}
+        launch_limits: list[Decimal] = []
+        for mpn, demand in fgpn.material_demands.items():
+            if demand <= 0:
                 continue
+            usage = demand / fgpn.requested_quantity
+            per_piece[mpn] = usage
+            available = logical_remaining.get(mpn, Decimal("0"))
+            launch_limits.append((available / usage).to_integral_value(rounding=ROUND_FLOOR))
 
-            launchable_quantities = []
-            for mpn, demand in fgpn.material_demands.items():
-                if demand <= 0:
-                    continue
+        launchable = min([fgpn.requested_quantity, *launch_limits]) if launch_limits else Decimal("0")
+        launchable = max(Decimal("0"), launchable)
+        coverage_percents: list[Decimal] = []
 
-                pool = material_pools.get(mpn)
-                if not pool:
-                    launchable_quantities.append(Decimal('0'))
-                    continue
+        for mpn, demand in fgpn.material_demands.items():
+            covered = per_piece.get(mpn, Decimal("0")) * launchable
+            fgpn.material_allocations[mpn] = covered
+            logical_remaining[mpn] = max(
+                Decimal("0"), logical_remaining.get(mpn, Decimal("0")) - covered
+            )
+            shortfall = demand - covered
+            if shortfall > 0:
+                fgpn.is_fully_covered = False
+                fgpn.material_shortages[mpn] = shortfall
+            coverage_percents.append((covered / demand) * 100 if demand > 0 else Decimal("100"))
 
-                per_fgpn_quantity = demand / fgpn.requested_quantity
-                launchable_quantities.append(pool.total_available() / per_fgpn_quantity)
+        fgpn.percent_covered = min(coverage_percents) if coverage_percents else Decimal("0")
 
-            launchable_quantity = fgpn.requested_quantity
-            if launchable_quantities:
-                launchable_quantity = min([fgpn.requested_quantity, *launchable_quantities])
+    covered_by_material: dict[str, Decimal] = {}
+    for fgpn in fgpn_demands:
+        for mpn, quantity in fgpn.material_allocations.items():
+            covered_by_material[mpn] = covered_by_material.get(mpn, Decimal("0")) + quantity
 
-            coverage_percents = []
-            for mpn, demand in fgpn.material_demands.items():
-                if demand <= 0:
-                    continue
-
-                pool = material_pools.get(mpn)
-                required_for_launchable = (demand / fgpn.requested_quantity) * launchable_quantity
-                if not pool:
-                    allocated = Decimal('0')
-                    slot_allocs = []
-                else:
-                    allocated, slot_allocs = allocate_material(pool, required_for_launchable)
-
-                fgpn.material_allocations[mpn] = allocated
-                for slot, qty in slot_allocs:
-                    all_allocations.append((fgpn.fgpn_code, slot, qty))
-                    
-                if allocated < demand:
-                    shortfall = demand - allocated
-                    fgpn.is_fully_covered = False
-                    fgpn.material_shortages[mpn] = shortfall
-                    coverage_percents.append((allocated / demand) * 100)
-                else:
-                    coverage_percents.append(Decimal('100'))
-                    
-            if coverage_percents:
-                fgpn.percent_covered = sum(coverage_percents) / len(coverage_percents)
-
-    elif allocation_strategy == 'MANUAL':
-        # All demands are pooled together for each material to distribute fairly.
-        # But to distribute fairly, we calculate total demand per material across all FGPNs,
-        # then allocate, then assign proportionally.
-        # For simplicity and correctness with Greedy, we can just process them, but to be fair,
-        # we do a round-robin or proportional allocation.
-        
-        # We will do proportional allocation per material
-        for mpn, pool in material_pools.items():
-            # Find all FGPNs that need this material
-            fgpns_needing_mat = [f for f in fgpn_demands if f.material_demands.get(mpn, Decimal('0')) > 0]
-            if not fgpns_needing_mat:
-                continue
-                
-            total_mat_demand = sum(f.material_demands[mpn] for f in fgpns_needing_mat)
-            total_available = pool.total_available()
-            
-            if total_available >= total_mat_demand:
-                # Fully covered, just allocate sequentially
-                for fgpn in fgpns_needing_mat:
-                    demand = fgpn.material_demands[mpn]
-                    allocated, slot_allocs = allocate_material(pool, demand)
-                    fgpn.material_allocations[mpn] = allocated
-                    for slot, qty in slot_allocs:
-                        all_allocations.append((fgpn.fgpn_code, slot, qty))
-            else:
-                # Shortage: distribute proportionally
-                for fgpn in fgpns_needing_mat:
-                    demand = fgpn.material_demands[mpn]
-                    # proportional share
-                    share = (demand / total_mat_demand) * total_available
-                    
-                    allocated, slot_allocs = allocate_material(pool, share)
-                    fgpn.material_allocations[mpn] = allocated
-                    for slot, qty in slot_allocs:
-                        all_allocations.append((fgpn.fgpn_code, slot, qty))
-                        
-                    shortfall = demand - allocated
-                    fgpn.is_fully_covered = False
-                    fgpn.material_shortages[mpn] = shortfall
-                    
-        # Calculate coverage percentages
-        for fgpn in fgpn_demands:
-            if not fgpn.material_demands:
-                continue
-            percents = []
-            for mpn, demand in fgpn.material_demands.items():
-                shortfall = fgpn.material_shortages.get(mpn, Decimal('0'))
-                allocated = demand - shortfall
-                if demand > 0:
-                    percents.append((allocated / demand) * 100)
-            if percents:
-                fgpn.percent_covered = sum(percents) / len(percents)
+    all_allocations: list[tuple[str, StockSlot, Decimal]] = []
+    for mpn in sorted(covered_by_material):
+        covered_demand = covered_by_material[mpn]
+        if covered_demand <= 0:
+            continue
+        pool = material_pools.get(mpn)
+        if pool is None:
+            continue
+        allocated, slot_allocations = allocate_material(pool, covered_demand)
+        if allocated != covered_demand:
+            raise RuntimeError(
+                f"Global stock-unit selection covered {allocated} of {covered_demand} for {mpn}."
+            )
+        all_allocations.extend(("GLOBAL", slot, quantity) for slot, quantity in slot_allocations)
 
     return fgpn_demands, all_allocations

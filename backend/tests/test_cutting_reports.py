@@ -40,8 +40,8 @@ def production(db_session, seeded_db):
     db_session.flush()
     db_session.add(Material(material_part_number=MATERIAL, description="Cutting source material", material_type_id=material_type.material_type_id, unit_price=0))
     db_session.flush()
-    db_session.add(StockUnit(material_part_number=MATERIAL, quantity=100, status="PRODUCTION", created_at=now))
-    simulation = Simulation(simulation_mode="CURRENT_STOCK", target_date=date(2026, 8, 1), is_feasible=True,
+    db_session.add(StockUnit(business_unit_id="CUT-NEST-001", material_part_number=MATERIAL, quantity=100, status="PRODUCTION", created_at=now))
+    simulation = Simulation(project_id=1, simulation_mode="CURRENT_STOCK", target_date=date(2026, 8, 1), is_feasible=True,
         mtg_minutes_document_id=101, created_at=now, created_by=TEST_USER_ID)
     db_session.add(simulation)
     db_session.flush()
@@ -57,7 +57,12 @@ def stage(db):
 
 
 def posting(launch_id, unit="m"):
-    return CuttingReportPostRequest(launch_id=launch_id, usage_unit=unit, confirm_usage_is_consumption=True)
+    return CuttingReportPostRequest(
+        launch_id=launch_id,
+        usage_unit=unit,
+        confirm_usage_is_consumption=True,
+        stock_unit_ids_by_row={2: "CUT-NEST-001"},
+    )
 
 
 def test_import_keeps_original_and_does_not_change_stock(db_session, production):
@@ -77,6 +82,7 @@ def test_confirmed_consumption_reduces_wip_and_cannot_repeat(db_session, product
     assert get_material_stock_detail(db_session, MATERIAL).production == Decimal("32.7420")
     row = db_session.scalars(select(CuttingConsumption)).one()
     assert row.quantity_consumed == Decimal("67.2580")
+    assert row.stock_unit.business_unit_id == "CUT-NEST-001"
     assert row.source_row_number == 2 and row.source_report_id == staged.report_id
     assert row.consumed_at == datetime(2026, 8, 3, 0, 3, 20)
     with pytest.raises(ConflictException, match="already been posted"):

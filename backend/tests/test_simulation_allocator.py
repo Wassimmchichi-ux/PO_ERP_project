@@ -102,8 +102,8 @@ def test_insufficient_stock():
     assert len(allocs) == 2
 
 
-def test_priority_mode_allocation():
-    """Priority mode should fully satisfy high priority before low."""
+def test_ordered_allocation_satisfies_higher_priority_first():
+    """The ordered process should fully satisfy high priority before low."""
     pool = MaterialPool(
         material_part_number='MAT1',
         warehouse_slots=[StockSlot(1, 'WAREHOUSE', Decimal('100.0'))]
@@ -118,17 +118,16 @@ def test_priority_mode_allocation():
     demands, allocs = run_allocation_engine(
         [fgpn2, fgpn1], # out of order
         {'MAT1': pool},
-        'PRIORITY'
     )
     
     assert fgpn1.is_fully_covered is True
     assert fgpn1.percent_covered == Decimal('100.0')
     
     assert fgpn2.is_fully_covered is False
-    assert fgpn2.material_shortages['MAT1'] == Decimal('20.0')
+    assert fgpn2.material_shortages['MAT1'] == Decimal('24.0')
 
 
-def test_priority_mode_does_not_overallocate_non_limiting_material():
+def test_ordered_allocation_does_not_overallocate_non_limiting_material():
     """Partial FGPN coverage should allocate only materials needed for launchable items."""
     mat1 = MaterialPool(
         material_part_number='MAT1',
@@ -146,7 +145,6 @@ def test_priority_mode_does_not_overallocate_non_limiting_material():
     demands, allocs = run_allocation_engine(
         [fgpn],
         {'MAT1': mat1, 'MAT2': mat2},
-        'PRIORITY'
     )
 
     assert fgpn.launchable_quantity == Decimal('50.0')
@@ -156,8 +154,8 @@ def test_priority_mode_does_not_overallocate_non_limiting_material():
     assert fgpn.material_shortages['MAT2'] == Decimal('50.0')
 
 
-def test_manual_mode_allocation():
-    """Manual mode should distribute proportionally if insufficient."""
+def test_ordered_manual_quantities_respect_priority():
+    """The editable quantities use one ordered, whole-piece allocation process."""
     pool = MaterialPool(
         material_part_number='MAT1',
         warehouse_slots=[StockSlot(1, 'WAREHOUSE', Decimal('100.0'))]
@@ -166,41 +164,43 @@ def test_manual_mode_allocation():
     fgpn1 = FgpnDemand(1, 'FG1', priority=1, po_quantity=Decimal('10'), requested_quantity=Decimal('10'))
     fgpn1.material_demands['MAT1'] = Decimal('75.0')
     
-    fgpn2 = FgpnDemand(2, 'FG2', priority=1, po_quantity=Decimal('10'), requested_quantity=Decimal('10'))
+    fgpn2 = FgpnDemand(2, 'FG2', priority=2, po_quantity=Decimal('10'), requested_quantity=Decimal('10'))
     fgpn2.material_demands['MAT1'] = Decimal('75.0')
     
     demands, allocs = run_allocation_engine(
         [fgpn1, fgpn2],
         {'MAT1': pool},
-        'MANUAL'
     )
-    
-    # Each wants 75 (total 150), available 100. So each gets (75/150)*100 = 50.
-    assert fgpn1.material_shortages['MAT1'] == Decimal('25.0')
-    assert fgpn2.material_shortages['MAT1'] == Decimal('25.0')
+
+    assert fgpn1.is_fully_covered
+    assert fgpn1.material_allocations['MAT1'] == Decimal('75.0')
+    assert fgpn2.launchable_quantity == Decimal('3.0')
+    assert fgpn2.material_shortages['MAT1'] == Decimal('52.5')
 
 
-def test_priority_plus_manual_mode():
-    """Priority + Manual mode respects priority order but uses manual quantities."""
+def test_global_whole_roll_selection_covers_multiple_ordered_demands():
+    """Whole rolls are selected once for the combined multi-PO material demand."""
     pool = MaterialPool(
         material_part_number='MAT1',
-        warehouse_slots=[StockSlot(1, 'WAREHOUSE', Decimal('100.0'))]
+        warehouse_slots=[
+            StockSlot(1, 'WAREHOUSE', Decimal('10.0'), can_split=False),
+            StockSlot(2, 'WAREHOUSE', Decimal('10.0'), can_split=False),
+        ]
     )
-    
-    fgpn1 = FgpnDemand(1, 'FG1', priority=2, po_quantity=Decimal('10'), requested_quantity=Decimal('0'))
-    fgpn1.material_demands['MAT1'] = Decimal('0.0')
-    
-    fgpn2 = FgpnDemand(2, 'FG2', priority=1, po_quantity=Decimal('10'), requested_quantity=Decimal('10'))
-    fgpn2.material_demands['MAT1'] = Decimal('100.0')
-    
+    fgpn1 = FgpnDemand(1, 'FG1', priority=1, po_quantity=Decimal('11'), requested_quantity=Decimal('11'))
+    fgpn1.material_demands['MAT1'] = Decimal('11.0')
+    fgpn2 = FgpnDemand(2, 'FG2', priority=2, po_quantity=Decimal('9'), requested_quantity=Decimal('9'))
+    fgpn2.material_demands['MAT1'] = Decimal('9.0')
+
     demands, allocs = run_allocation_engine(
         [fgpn1, fgpn2],
         {'MAT1': pool},
-        'PRIORITY_PLUS_MANUAL'
     )
-    
+
+    assert fgpn1.is_fully_covered is True
     assert fgpn2.is_fully_covered is True
-    assert fgpn1.is_fully_covered is True # 0 demand is fully covered
+    assert len(allocs) == 2
+    assert sum((quantity for _, _, quantity in allocs), Decimal('0')) == Decimal('20.0')
 
 
 def test_launch_issue_reduces_component_package_quantity():

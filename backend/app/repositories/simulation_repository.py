@@ -18,6 +18,9 @@ from app.models.purchase_order import PurchaseOrder
 from app.models.purchase_order_line import PurchaseOrderLine
 from app.models.purchase_order_version import PurchaseOrderVersion
 from app.models.fgpn import FGPN
+from app.models.launch import Launch
+from app.models.launch_fgpn import LaunchFGPN
+from app.models.project import Project
 
 
 def get_current_boms_for_fgpns(db: Session, fgpn_ids: list[int]) -> dict[int, BOM]:
@@ -91,6 +94,48 @@ def get_fgpns(db: Session, fgpn_ids: list[int]) -> dict[int, FGPN]:
     return {fgpn.fgpn_id: fgpn for fgpn in fgpns}
 
 
+def get_project(db: Session, project_id: int) -> Project | None:
+    """Fetch the project that scopes a simulation."""
+    return db.get(Project, project_id)
+
+
+def get_planned_launch_quantities_by_po_line(
+    db: Session,
+    po_line_ids: list[int],
+) -> dict[int, Decimal]:
+    """Return quantities already committed to non-cancelled launches."""
+    if not po_line_ids:
+        return {}
+    stmt = (
+        select(
+            LaunchFGPN.po_line_id,
+            func.coalesce(func.sum(LaunchFGPN.planned_quantity), 0),
+        )
+        .join(Launch, Launch.launch_id == LaunchFGPN.launch_id)
+        .where(LaunchFGPN.po_line_id.in_(po_line_ids))
+        .where(Launch.status != "CANCELLED")
+        .group_by(LaunchFGPN.po_line_id)
+    )
+    return {po_line_id: quantity for po_line_id, quantity in db.execute(stmt).all()}
+
+
+def list_current_po_lines_for_project(db: Session, project_id: int) -> list[PurchaseOrderLine]:
+    """List current-version PO lines whose FGPN belongs to one project."""
+    stmt = (
+        select(PurchaseOrderLine)
+        .join(PurchaseOrderVersion, PurchaseOrderLine.po_version_id == PurchaseOrderVersion.po_version_id)
+        .join(PurchaseOrder, PurchaseOrder.current_version_id == PurchaseOrderVersion.po_version_id)
+        .join(FGPN, FGPN.fgpn_id == PurchaseOrderLine.fgpn_id)
+        .options(
+            joinedload(PurchaseOrderLine.po_version).joinedload(PurchaseOrderVersion.purchase_order),
+            joinedload(PurchaseOrderLine.fgpn),
+        )
+        .where(FGPN.project_id == project_id)
+        .order_by(PurchaseOrder.po_number, PurchaseOrderLine.line_number)
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
 def get_simulation_allocations(
     db: Session,
     simulation_id: int,
@@ -120,6 +165,15 @@ def get_simulation(db: Session, simulation_id: int) -> Simulation | None:
     """Fetch one simulation."""
     return db.execute(
         select(Simulation).where(Simulation.simulation_id == simulation_id)
+    ).scalar_one_or_none()
+
+
+def get_simulation_for_update(db: Session, simulation_id: int) -> Simulation | None:
+    """Lock one simulation so launch execution is serialized."""
+    return db.execute(
+        select(Simulation)
+        .where(Simulation.simulation_id == simulation_id)
+        .with_for_update()
     ).scalar_one_or_none()
 
 
@@ -157,30 +211,37 @@ def save_simulation(
     stock_scope_mode: str,
     stock_owner_user_id: uuid.UUID | None,
     include_global_stock: bool,
-    allocation_strategy: str,
+    project_id: int,
     target_date: datetime.date,
     safety_coefficient: Decimal,
     is_feasible: bool,
     shortfall_json: str,
-    mtg_minutes_document_id: int,
+    mtg_minutes_document_id: int | None,
     created_by: uuid.UUID,
     allocations: list[dict],
     selected_fgpns: list[dict],
 ) -> int:
     """Save the official simulation and its allocations."""
     
+    now = datetime.datetime.now()
     sim = Simulation(
+        project_id=project_id,
         simulation_mode=simulation_mode,
         stock_scope_mode=stock_scope_mode,
         stock_owner_user_id=stock_owner_user_id,
         include_global_stock=include_global_stock,
-        allocation_strategy=allocation_strategy,
         target_date=target_date,
         safety_coefficient=safety_coefficient,
         is_feasible=is_feasible,
         shortfall_json=shortfall_json,
         mtg_minutes_document_id=mtg_minutes_document_id,
-        created_at=datetime.datetime.now(),
+        workflow_status="READY" if mtg_minutes_document_id is not None else "AWAITING_DOCUMENT",
+        document_due_at=(
+            None
+            if mtg_minutes_document_id is not None
+            else now + datetime.timedelta(hours=24)
+        ),
+        created_at=now,
         created_by=created_by
     )
     db.add(sim)
@@ -205,7 +266,7 @@ def save_simulation(
         simulation_id=sim.simulation_id,
         allocations=allocations,
         allocation_type='SIMULATION',
-        status='SIMULATED',
+        status='RESERVED',
     )
         
     db.flush()

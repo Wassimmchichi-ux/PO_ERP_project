@@ -32,3 +32,7 @@ class CuttingReportPostRequest(BaseModel):
     launch_id: int = Field(gt=0)
     usage_unit: Literal["m", "sqm", "pcs", "kg"]
     confirm_usage_is_consumption: Literal[True]
+    stock_unit_ids_by_row: dict[int, str] = Field(
+        default_factory=dict,
+        description="Optional explicit business stock-unit IDs for source rows whose Original nesting name is blank.",
+    )

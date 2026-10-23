@@ -18,6 +18,7 @@ from app.models.launch_fgpn import LaunchFGPN
 from app.models.launch_po import LaunchPO
 from app.models.launch_verification import LaunchVerification
 from app.models.login_event import LoginEvent
+from app.models.notification import Notification
 from app.models.manufacturing_receiver import ManufacturingReceiver
 from app.models.material import Material
 from app.models.material_type import MaterialType
@@ -33,13 +34,18 @@ from app.models.simulation import Simulation
 from app.models.simulation_fgpn import SimulationFGPN
 from app.models.stock_allocation import StockAllocation
 from app.models.stock_issue_handover import StockIssueHandover
+from app.models.stock_movement import StockMovement
 from app.models.stock_unit import StockUnit
+from app.models.supplier import Supplier
+from app.models.supplier_material_order import SupplierMaterialOrder
+from app.models.supplier_material_order_line import SupplierMaterialOrderLine
 from app.models.user import User
 
 __all__ = [
     "Base",
     "User",
     "LoginEvent",
+    "Notification",
     "Customer",
     "Contact",
     "MaterialType",
@@ -48,6 +54,10 @@ __all__ = [
     "Project",
     "Material",
     "StockUnit",
+    "StockMovement",
+    "Supplier",
+    "SupplierMaterialOrder",
+    "SupplierMaterialOrderLine",
     "Document",
     "FGPN",
     "AuditLog",

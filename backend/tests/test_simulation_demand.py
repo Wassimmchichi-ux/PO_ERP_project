@@ -2,6 +2,8 @@
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from app.schemas.simulation import SimulationPreviewRequest, FgpnSimulationRequest
 from app.services.material_simulation_service import preview_simulation
 from app.models.bom import BOM
@@ -10,6 +12,29 @@ from app.models.fgpn import FGPN
 from app.models.material import Material
 from app.models.material_type import MaterialType
 from app.services.simulation_allocator import MaterialPool, StockSlot
+
+
+def test_simulation_request_rejects_duplicate_po_line_selection():
+    with pytest.raises(ValueError, match="selected only once"):
+        SimulationPreviewRequest(
+            project_id=1,
+            fgpns=[
+                FgpnSimulationRequest(
+                    po_id=1,
+                    po_line_id=10,
+                    fgpn_id=1,
+                    priority=1,
+                    requested_quantity=Decimal("5"),
+                ),
+                FgpnSimulationRequest(
+                    po_id=1,
+                    po_line_id=10,
+                    fgpn_id=1,
+                    priority=2,
+                    requested_quantity=Decimal("3"),
+                ),
+            ],
+        )
 
 
 class MockSession:
@@ -31,7 +56,7 @@ def test_simulation_demand_calculation(monkeypatch):
     
     # 1. Setup Mock BOM
     fgpn_id = 1
-    fgpn = FGPN(fgpn_id=fgpn_id, fgpn_code="6855872-7S08-000")
+    fgpn = FGPN(fgpn_id=fgpn_id, project_id=1, fgpn_code="6855872-7S08-000")
     
     bom = BOM(bom_id=1, fgpn_id=fgpn_id, is_current=True)
     # M row
@@ -57,6 +82,8 @@ def test_simulation_demand_calculation(monkeypatch):
     import app.services.material_simulation_service as sim_svc
     
     monkeypatch.setattr(sim_repo, 'get_current_boms_for_fgpns', lambda db, ids: {fgpn_id: bom})
+    monkeypatch.setattr(sim_repo, 'get_project', lambda db, project_id: SimpleNamespace(project_id=1, status="Active", launch_engineer_user_id=None))
+    monkeypatch.setattr(sim_repo, 'get_planned_launch_quantities_by_po_line', lambda *args: {})
     monkeypatch.setattr(sim_repo, 'get_fgpns', lambda db, ids: {fgpn_id: fgpn})
     monkeypatch.setattr(sim_repo, 'get_po_lines', lambda db, ids: {})
     monkeypatch.setattr(
@@ -65,10 +92,11 @@ def test_simulation_demand_calculation(monkeypatch):
         lambda db, pairs: {
             (1, fgpn_id): SimpleNamespace(
                 po_line_id=10,
+                po_version_id=1,
                 fgpn_id=fgpn_id,
                 ordered_quantity=Decimal('300'),
                 po_version=SimpleNamespace(
-                    purchase_order=SimpleNamespace(po_id=1, po_number="PO-001")
+                    purchase_order=SimpleNamespace(po_id=1, po_number="PO-001", current_version_id=1)
                 ),
             )
         },
@@ -83,6 +111,7 @@ def test_simulation_demand_calculation(monkeypatch):
     
     # 3. Create Request
     req = SimulationPreviewRequest(
+        project_id=1,
         fgpns=[
             FgpnSimulationRequest(
                 po_id=1,
@@ -91,7 +120,6 @@ def test_simulation_demand_calculation(monkeypatch):
                 priority=1
             )
         ],
-        allocation_strategy="PRIORITY",
         safety_coefficient=Decimal('1.0')
     )
     
@@ -114,8 +142,8 @@ def test_simulation_demand_calculation(monkeypatch):
 
 def test_selected_fgpn_priority_reports_launchable_quantities(monkeypatch):
     """Selected FGPN rows should be simulated by priority, not by all PO FGPNs."""
-    fgpn_1 = FGPN(fgpn_id=1, fgpn_code="FGPN-001")
-    fgpn_2 = FGPN(fgpn_id=2, fgpn_code="FGPN-002")
+    fgpn_1 = FGPN(fgpn_id=1, project_id=1, fgpn_code="FGPN-001")
+    fgpn_2 = FGPN(fgpn_id=2, project_id=1, fgpn_code="FGPN-002")
 
     bom_1 = BOM(bom_id=1, fgpn_id=1, is_current=True)
     bom_1.lines = [
@@ -142,6 +170,8 @@ def test_selected_fgpn_priority_reports_launchable_quantities(monkeypatch):
     import app.services.material_simulation_service as sim_svc
 
     monkeypatch.setattr(sim_repo, 'get_current_boms_for_fgpns', lambda db, ids: {1: bom_1, 2: bom_2})
+    monkeypatch.setattr(sim_repo, 'get_project', lambda db, project_id: SimpleNamespace(project_id=1, status="Active", launch_engineer_user_id=None))
+    monkeypatch.setattr(sim_repo, 'get_planned_launch_quantities_by_po_line', lambda *args: {})
     monkeypatch.setattr(sim_repo, 'get_fgpns', lambda db, ids: {1: fgpn_1, 2: fgpn_2})
     monkeypatch.setattr(sim_repo, 'get_po_lines', lambda db, ids: {})
     monkeypatch.setattr(
@@ -150,18 +180,20 @@ def test_selected_fgpn_priority_reports_launchable_quantities(monkeypatch):
         lambda db, pairs: {
             (101, 1): SimpleNamespace(
                 po_line_id=11,
+                po_version_id=11,
                 fgpn_id=1,
                 ordered_quantity=Decimal('100'),
                 po_version=SimpleNamespace(
-                    purchase_order=SimpleNamespace(po_id=101, po_number="PO-101")
+                    purchase_order=SimpleNamespace(po_id=101, po_number="PO-101", current_version_id=11)
                 ),
             ),
             (202, 2): SimpleNamespace(
                 po_line_id=22,
+                po_version_id=22,
                 fgpn_id=2,
                 ordered_quantity=Decimal('200'),
                 po_version=SimpleNamespace(
-                    purchase_order=SimpleNamespace(po_id=202, po_number="PO-202")
+                    purchase_order=SimpleNamespace(po_id=202, po_number="PO-202", current_version_id=22)
                 ),
             ),
         },
@@ -195,11 +227,11 @@ def test_selected_fgpn_priority_reports_launchable_quantities(monkeypatch):
     monkeypatch.setattr(stock_repo, 'get_in_transit_stock_by_material', lambda db, **kwargs: {})
 
     req = SimulationPreviewRequest(
+        project_id=1,
         fgpns=[
             FgpnSimulationRequest(po_id=101, fgpn_id=1, requested_quantity=Decimal('100'), priority=1),
             FgpnSimulationRequest(po_id=202, fgpn_id=2, requested_quantity=Decimal('200'), priority=2),
         ],
-        allocation_strategy="PRIORITY",
         safety_coefficient=Decimal('1.0'),
     )
 
@@ -246,12 +278,18 @@ def test_build_pools_marks_roll_slots_as_whole_issue(monkeypatch):
     warehouse_units = [
         SimpleNamespace(
             stock_unit_id=1,
+            business_unit_id="ROLL-1",
+            user=None,
+            user_id=None,
             material_part_number="ROLL-MAT",
             quantity=Decimal('60'),
             expected_arrival_date=None,
         ),
         SimpleNamespace(
             stock_unit_id=2,
+            business_unit_id="COMP-1",
+            user=None,
+            user_id=None,
             material_part_number="COMP-MAT",
             quantity=Decimal('50'),
             expected_arrival_date=None,
@@ -260,6 +298,9 @@ def test_build_pools_marks_roll_slots_as_whole_issue(monkeypatch):
     transit_units = [
         SimpleNamespace(
             stock_unit_id=3,
+            business_unit_id="ROLL-2",
+            user=None,
+            user_id=None,
             material_part_number="ROLL-MAT",
             quantity=Decimal('40'),
             expected_arrival_date=None,
@@ -270,10 +311,13 @@ def test_build_pools_marks_roll_slots_as_whole_issue(monkeypatch):
     monkeypatch.setattr(
         stock_repo,
         'get_positive_stock_units_by_status',
-        lambda db, status, **kwargs: warehouse_units if status == 'WAREHOUSE' else transit_units,
+        lambda db, status, **kwargs: (
+            warehouse_units if status == 'WAREHOUSE' else transit_units if status == 'IN_TRANSIT' else []
+        ),
     )
-    monkeypatch.setattr(stock_repo, 'get_production_stock_by_material', lambda db: {})
-    monkeypatch.setattr(stock_repo, 'get_cutting_consumption_by_material', lambda db: {})
+    monkeypatch.setattr(stock_repo, 'get_cutting_consumption_by_stock_unit', lambda db: {})
+    monkeypatch.setattr(stock_repo, 'get_unassigned_cutting_consumption_by_material', lambda db: {})
+    monkeypatch.setattr(stock_repo, 'get_reserved_quantities_by_stock_unit', lambda db: {})
 
     pools = sim_svc._build_pools(None, include_in_transit=True)
 

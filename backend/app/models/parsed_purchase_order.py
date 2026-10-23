@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Identity, Integer, String
+from sqlalchemy import JSON, DateTime, ForeignKey, Identity, Integer, LargeBinary, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -24,6 +24,8 @@ class ParsedPurchaseOrder(Base):
         nullable=True,
     )
     source_file_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_content: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    source_content_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     parser_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     parser_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
     status: Mapped[str] = mapped_column(

@@ -1,6 +1,6 @@
 # Adient ERP Documentation
 
-Updated 22 October 2026.
+Updated 23 October 2026.
 
 - [Business documentation](BUSINESS_DOCUMENTATION.md): role workflows, business rules, operational boundaries, and acceptance scenarios.
 - [Technical documentation](TECHNICAL_DOCUMENTATION.md): architecture, simulation algorithm, stock/database modeling, source formats, setup, migrations, and verification.

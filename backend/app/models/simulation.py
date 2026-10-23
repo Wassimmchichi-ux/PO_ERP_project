@@ -21,11 +21,10 @@ class Simulation(Base):
         nullable=False,
         comment="CURRENT_STOCK, INCLUDING_IN_TRANSIT",
     )
-    allocation_strategy: Mapped[str] = mapped_column(
-        String(30),
+    project_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("Project.project_id", deferrable=True, initially="IMMEDIATE"),
         nullable=False,
-        server_default="PRIORITY",
-        comment="PRIORITY, MANUAL, PRIORITY_PLUS_MANUAL",
     )
     stock_scope_mode: Mapped[str] = mapped_column(
         String(30),
@@ -52,11 +51,19 @@ class Simulation(Base):
     )
     is_feasible: Mapped[bool] = mapped_column(Boolean, nullable=False)
     shortfall_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    mtg_minutes_document_id: Mapped[int] = mapped_column(
+    mtg_minutes_document_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("Document.document_id", deferrable=True, initially="IMMEDIATE"),
-        nullable=False,
+        nullable=True,
     )
+    workflow_status: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        server_default="AWAITING_DOCUMENT",
+        comment="AWAITING_DOCUMENT, READY, RELEASED, LAUNCHED",
+    )
+    document_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    launched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     created_by: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -69,6 +76,7 @@ class Simulation(Base):
         "User",
         foreign_keys=[created_by],
     )
+    project: Mapped["Project"] = relationship("Project")
     stock_owner: Mapped["User | None"] = relationship(
         "User",
         foreign_keys=[stock_owner_user_id],

@@ -40,7 +40,13 @@ Permission = Literal[
     "stock.transit.write",
     "stock.cutman.import",
     "stock.receive",
+    "stock.reception.correct",
+    "stock.threshold.write",
     "stock.view",
+    "supplier.order.write",
+    "supplier.arrival.enter",
+    "supplier.arrival.confirm",
+    "notification.view",
 ]
 
 
@@ -105,7 +111,13 @@ ADMIN_PERMISSIONS: frozenset[Permission] = frozenset(
         "stock.transit.write",
         "stock.cutman.import",
         "stock.receive",
+        "stock.reception.correct",
+        "stock.threshold.write",
         "stock.view",
+        "supplier.order.write",
+        "supplier.arrival.enter",
+        "supplier.arrival.confirm",
+        "notification.view",
     }
 )
 
@@ -123,6 +135,7 @@ ROLE_PERMISSIONS: dict[RoleCode, frozenset[Permission]] = {
             "project.view",
             "simulation.view",
             "stock.view",
+            "notification.view",
         }
     ),
     "LAUNCH_MANAGER": frozenset(
@@ -150,6 +163,10 @@ ROLE_PERMISSIONS: dict[RoleCode, frozenset[Permission]] = {
             "stock.transit.write",
             "stock.cutman.import",
             "stock.view",
+            "stock.reception.correct",
+            "stock.threshold.write",
+            "supplier.order.write",
+            "notification.view",
         }
     ),
     "LAUNCH_ENGINEER": frozenset(
@@ -176,6 +193,10 @@ ROLE_PERMISSIONS: dict[RoleCode, frozenset[Permission]] = {
             "stock.transit.write",
             "stock.cutman.import",
             "stock.view",
+            "stock.reception.correct",
+            "stock.threshold.write",
+            "supplier.order.write",
+            "notification.view",
         }
     ),
     "WAREHOUSE_TEAM_LEADER": frozenset(
@@ -184,9 +205,14 @@ ROLE_PERMISSIONS: dict[RoleCode, frozenset[Permission]] = {
             "handover.confirm",
             "handover.create",
             "stock.receive",
+            "stock.reception.correct",
             "stock.view",
+            "supplier.arrival.confirm",
+            "notification.view",
         }
     ),
-    "WAREHOUSE_PERSONNEL": frozenset({"stock.receive", "stock.view"}),
+    "WAREHOUSE_PERSONNEL": frozenset(
+        {"stock.receive", "stock.view", "supplier.arrival.enter", "notification.view"}
+    ),
     "MANUFACTURING_OPERATOR": frozenset({"handover.confirm", "stock.view"}),
 }

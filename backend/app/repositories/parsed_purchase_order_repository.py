@@ -32,6 +32,8 @@ def create_parsed_purchase_order(
     created_by: uuid.UUID,
     document_id: int | None = None,
     source_file_name: str | None = None,
+    source_content: bytes | None = None,
+    source_content_type: str | None = None,
     parser_name: str | None = None,
     parser_version: str | None = None,
 ) -> ParsedPurchaseOrder:
@@ -39,6 +41,8 @@ def create_parsed_purchase_order(
     parsed_po = ParsedPurchaseOrder(
         document_id=document_id,
         source_file_name=source_file_name,
+        source_content=source_content,
+        source_content_type=source_content_type,
         parser_name=parser_name,
         parser_version=parser_version,
         status="PARSED",
@@ -182,7 +186,11 @@ def import_effective_purchase_order(
         document = Document(
             document_type="PO",
             file_name=parsed_po.source_file_name or f"{po_number}.json",
-            file_path=f"/uploads/{parsed_po.source_file_name or f'{po_number}.json'}",
+            file_path=(
+                f"/purchase-orders/parsed/{parsed_po.parsed_po_id}/source"
+                if parsed_po.source_content is not None
+                else f"/uploads/{parsed_po.source_file_name or f'{po_number}.json'}"
+            ),
             version=version_number,
             uploaded_at=now,
             uploaded_by=imported_by,

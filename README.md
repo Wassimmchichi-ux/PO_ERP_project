@@ -4,7 +4,7 @@ Industrial ERP prototype developed by Wassim Mchichi for purchase-order intake, 
 
 ## Local app
 
-The Docker deployment checked on 22 October 2026 is available at:
+The Docker deployment checked on 23 October 2026 is available at:
 
 - **Application:** http://localhost:5173
 - **Backend/API reference:** http://localhost:8080/docs
@@ -16,7 +16,7 @@ Start or rebuild it from this directory:
 docker compose up -d --build
 ```
 
-Startup initializes an empty PostgreSQL schema or upgrades an existing versioned database. It never resets records automatically. For native development and the explicit disposable-data reset/seed command, see the [setup guide](docs/TECHNICAL_DOCUMENTATION.md#2-runtime-and-local-setup).
+Startup initializes an empty PostgreSQL schema or upgrades an existing versioned database. It never resets records automatically. Add repeatable supplier/transit/reception examples with `docker compose exec backend python -m app.db.bootstrap --seed-demo-workflows`. For native development and the explicit disposable-data reset/seed commands, see the [setup guide](docs/TECHNICAL_DOCUMENTATION.md#2-local-deployment).
 
 ## Documentation
 
@@ -24,13 +24,13 @@ Startup initializes an empty PostgreSQL schema or upgrades an existing versioned
 - [Technical documentation](docs/TECHNICAL_DOCUMENTATION.md): architecture, stock/database model, simulation algorithms, document formats, API integration, migrations, and verification.
 - [Technical and business issues only](docs/ISSUES_REGISTER.md): remaining defects, business decisions, consequences, priorities, and evidence.
 
-The current business-test documents are supported: three Adient PO PDFs, the two-FGPN MBOM workbook, and the cutting-report workbook. The disposable local database contains their imported/staged records. PO/BOM/cutting identifiers do not match each other; no associations were invented. Cutting usage needs explicit launch/unit confirmation before posting.
+The current business-test documents are supported: three Adient PO PDFs, the two-FGPN MBOM workbook, and the cutting-report workbook. PO/BOM/cutting identifiers do not match each other, so no associations were invented. Cutting usage needs explicit launch/unit confirmation before posting.
 
-Allocation now uses production remainder, then warehouse, then optional transit arriving by the target date. Launch engineers/managers can edit supplier arrival dates with a recorded reason. The frontend uses Adient branding.
+The frontend and backend now share one **Order + Manual Entry** planner across multiple POs/FGPNs. Allocation uses production remainder, warehouse, then optional transit due by the target date. Physical units are selected globally per material, saved simulations reserve them, and launch retries are idempotent. Administrators maintain the supplier master; launch engineers/managers select a supplier and plan quantities/ETAs; the system generates stock-unit IDs; warehouse personnel record received quantities; and team leaders confirm arrivals. The frontend uses Adient branding.
 
 ## Verification and boundaries
 
-All **91 backend tests** pass. The frontend production build, changed-file lint, transit-eligibility tests, PostgreSQL migration/reset/import checks, and local HTTP smoke checks pass. **17 existing TypeScript diagnostics remain.** Several screens still use demonstration data, and the browser simulator is not yet connected to the backend simulation calculation. See the issues register before relying on the prototype operationally.
+The backend suite contains **99 tests**. In this restricted runner, 97 non-HTTP tests pass; the two in-process HTTP transport tests hang because the runner prevents worker-thread dispatch. Live Docker checks confirm the supplier order and transit endpoints expose the same order, project, generated reference, planned quantity, actual quantity, and workflow state. Stock summary, reception, and history use the same database records. Frontend TypeScript checking, linting, and the production build pass. The local PostgreSQL database is at migration `e9a1c4f6b802`. Several older screens still use demonstration data, and authentication plus the downstream launch/handover chain remain incomplete. See the issues register before relying on the prototype operationally.
 
 ## Repository
 

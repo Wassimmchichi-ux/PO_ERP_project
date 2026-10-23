@@ -21,9 +21,11 @@ from app.api.bom import router as bom_router
 from app.api.customer_delivery import router as customer_delivery_router
 from app.api.handover import router as handover_router
 from app.api.parsed_purchase_order import router as parsed_purchase_order_router
+from app.api.purchase_orders import router as purchase_orders_router
 from app.api.projects import router as projects_router
 from app.api.stock import router as stock_router
 from app.api.simulation import router as simulation_router
+from app.api.supplier_orders import router as supplier_orders_router
 from app.core.config import settings
 from app.core.logging import configure_logging
 from app.exceptions.handlers import register_exception_handlers
@@ -80,10 +82,12 @@ def create_app() -> FastAPI:
     app.include_router(bom_router)
     app.include_router(projects_router)
     app.include_router(parsed_purchase_order_router)
+    app.include_router(purchase_orders_router)
     from app.api.cutting_reports import router as cutting_reports_router
     app.include_router(cutting_reports_router)
     app.include_router(stock_router)
     app.include_router(simulation_router)
+    app.include_router(supplier_orders_router)
     app.include_router(handover_router)
     app.include_router(customer_delivery_router)
 

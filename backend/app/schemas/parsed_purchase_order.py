@@ -44,6 +44,7 @@ class ParsedPurchaseOrderResponse(BaseModel):
     parsed_po_id: int
     document_id: Optional[int] = None
     source_file_name: Optional[str] = None
+    has_source_file: bool = False
     parser_name: Optional[str] = None
     parser_version: Optional[str] = None
     status: str

@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
 from app.exceptions.base import ConflictException, NotFoundException, ValidationException
+from app.models import Document
 from app.policies import PolicyActor, policy_engine, system_actor
 from app.repositories import simulation_repository, stock_repository
 from app.schemas.simulation import (
@@ -21,16 +22,19 @@ from app.schemas.simulation import (
     LaunchAvailabilityIssue,
     LaunchReviewResult,
     LaunchSimulationResponse,
+    SimulationOptionLine,
+    SimulationOptionsResponse,
     SimulationSaveRequest,
-    SimulationSaveResponse
+    SimulationSaveResponse,
+    SimulationWorkflowResponse,
 )
-from app.services.stock_management_service import _compute_remaining_production
 from app.services.simulation_allocator import (
     StockSlot, 
     MaterialPool, 
     FgpnDemand, 
     run_allocation_engine
 )
+from app.services import stock_movement_service
 
 
 def _material_suggestion(mpn: str, shortfall: Decimal, include_in_transit: bool, in_transit: Decimal) -> str | None:
@@ -63,6 +67,54 @@ def _preview_suggestion(is_feasible: bool, material_summaries: list[MaterialSimu
     return f"Prioritize resolving material shortfalls for {shown} before launching the uncovered quantities."
 
 
+def list_simulation_options(
+    db: Session,
+    project_id: int,
+    *,
+    actor: PolicyActor | None = None,
+) -> SimulationOptionsResponse:
+    """Return current outstanding PO/FGPN rows for the ordered planner."""
+    acting_actor = actor or system_actor()
+    policy_engine.require(acting_actor, "simulation.run")
+    project = simulation_repository.get_project(db, project_id)
+    if project is None:
+        raise NotFoundException(f"Project {project_id} not found.")
+    if project.status != "Active":
+        raise ValidationException(f"Project {project_id} is not active.")
+    if (
+        acting_actor.normalized_role == "LAUNCH_ENGINEER"
+        and acting_actor.user_id is not None
+        and acting_actor.user_id != project.launch_engineer_user_id
+    ):
+        raise ValidationException("Launch engineers may view only their assigned project.")
+
+    lines = simulation_repository.list_current_po_lines_for_project(db, project_id)
+    planned = simulation_repository.get_planned_launch_quantities_by_po_line(
+        db, [line.po_line_id for line in lines]
+    )
+    return SimulationOptionsResponse(
+        project_id=project_id,
+        lines=[
+            SimulationOptionLine(
+                po_id=line.po_version.purchase_order.po_id,
+                po_number=line.po_version.purchase_order.po_number,
+                po_line_id=line.po_line_id,
+                fgpn_id=line.fgpn_id,
+                fgpn_code=line.fgpn.fgpn_code,
+                description=line.description or line.fgpn.description,
+                ordered_quantity=line.ordered_quantity,
+                already_planned_quantity=planned.get(line.po_line_id, Decimal("0")),
+                outstanding_quantity=max(
+                    Decimal("0"),
+                    line.ordered_quantity - planned.get(line.po_line_id, Decimal("0")),
+                ),
+            )
+            for line in lines
+            if line.ordered_quantity - planned.get(line.po_line_id, Decimal("0")) > 0
+        ],
+    )
+
+
 def _normalize_stock_scope_mode(mode: str | None) -> str:
     normalized = (mode or "ALL").strip().upper()
     if normalized not in {"ALL", "OWNED_ONLY"}:
@@ -75,11 +127,22 @@ def _is_roll_material_type(material_type_name: str | None, unit: str | None) -> 
     normalized_unit = (unit or "").strip().lower()
     return name in {"m", "roll", "rolls", "roll material"} or normalized_unit in {
         "m",
+        "me",
         "meter",
         "meters",
         "sqm",
         "m2",
     }
+
+
+def _simulation_unit(unit: str | None) -> str:
+    """Current business rule: the BOM Total sqm field is treated as metres."""
+    normalized = (unit or "").strip().lower()
+    if normalized in {"m", "me", "meter", "meters", "sqm", "m2"}:
+        return "m"
+    if normalized in {"ea", "piece", "pieces"}:
+        return "pcs"
+    return unit or "pcs"
 
 
 def _stock_owner_metadata(stock_unit) -> tuple[uuid.UUID | None, str | None, str | None]:
@@ -111,16 +174,19 @@ def _build_pools(
             assigned_only=True,
             include_global_stock=include_global_stock,
         )
-        prod_sent_map = stock_repository.get_production_stock_by_material(
+        prod_units = stock_repository.get_positive_stock_units_by_status(
             db,
+            'PRODUCTION',
             assigned_user_id=stock_owner_user_id,
             assigned_only=True,
             include_global_stock=include_global_stock,
         )
     else:
         wh_units = stock_repository.get_positive_stock_units_by_status(db, 'WAREHOUSE')
-        prod_sent_map = stock_repository.get_production_stock_by_material(db)
-    cons_map = stock_repository.get_cutting_consumption_by_material(db)
+        prod_units = stock_repository.get_positive_stock_units_by_status(db, 'PRODUCTION')
+    consumption_by_unit = stock_repository.get_cutting_consumption_by_stock_unit(db)
+    legacy_consumption = stock_repository.get_unassigned_cutting_consumption_by_material(db)
+    reserved_by_unit = stock_repository.get_reserved_quantities_by_stock_unit(db)
     transit_units = []
     if include_in_transit:
         if assigned_only:
@@ -148,11 +214,17 @@ def _build_pools(
         
         # Add warehouse
         for su in [u for u in wh_units if u.material_part_number == mpn]:
+            available_quantity = max(
+                Decimal('0'), su.quantity - reserved_by_unit.get(su.stock_unit_id, Decimal('0'))
+            )
+            if available_quantity <= 0:
+                continue
             assigned_user_id, assigned_user_name, assigned_user_role = _stock_owner_metadata(su)
             pool.warehouse_slots.append(StockSlot(
                 stock_unit_id=su.stock_unit_id,
                 source='WAREHOUSE',
-                quantity=su.quantity,
+                quantity=available_quantity,
+                business_unit_id=su.business_unit_id,
                 material_type=mtype.name,
                 can_split=not is_roll,
                 expected_arrival_date=su.expected_arrival_date,
@@ -161,31 +233,46 @@ def _build_pools(
                 assigned_user_role=assigned_user_role,
             ))
             
-        # Add production (we create one virtual slot for the remaining qty)
-        sent = prod_sent_map.get(mpn, Decimal('0'))
-        consumed = cons_map.get(mpn, Decimal('0'))
-        rem = _compute_remaining_production(sent, consumed)
-        if rem > 0:
-            owner = None
-            if assigned_only and stock_owner_user_id is not None:
-                owner = stock_repository.get_user(db, stock_owner_user_id)
+        # Production remainder stays tied to its business stock-unit identifier.
+        legacy_remaining = legacy_consumption.get(mpn, Decimal('0'))
+        for su in [u for u in prod_units if u.material_part_number == mpn]:
+            linked_consumed = consumption_by_unit.get(su.stock_unit_id, Decimal('0'))
+            after_linked = max(Decimal('0'), su.quantity - linked_consumed)
+            legacy_applied = min(after_linked, legacy_remaining)
+            legacy_remaining -= legacy_applied
+            rem = max(
+                Decimal('0'),
+                after_linked
+                - legacy_applied
+                - reserved_by_unit.get(su.stock_unit_id, Decimal('0')),
+            )
+            if rem <= 0:
+                continue
+            assigned_user_id, assigned_user_name, assigned_user_role = _stock_owner_metadata(su)
             pool.production_slots.append(StockSlot(
-                stock_unit_id=None,  # Virtual slot representing aggregated production remainder
+                stock_unit_id=su.stock_unit_id,
                 source='PRODUCTION',
                 quantity=rem,
+                business_unit_id=su.business_unit_id,
                 material_type=mtype.name,
-                assigned_user_id=stock_owner_user_id if assigned_only else None,
-                assigned_user_name=owner.full_name if owner else None,
-                assigned_user_role=owner.role if owner else None,
+                assigned_user_id=assigned_user_id,
+                assigned_user_name=assigned_user_name,
+                assigned_user_role=assigned_user_role,
             ))
             
         # Add in-transit
         for su in [u for u in transit_units if u.material_part_number == mpn]:
+            available_quantity = max(
+                Decimal('0'), su.quantity - reserved_by_unit.get(su.stock_unit_id, Decimal('0'))
+            )
+            if available_quantity <= 0:
+                continue
             assigned_user_id, assigned_user_name, assigned_user_role = _stock_owner_metadata(su)
             pool.in_transit_slots.append(StockSlot(
                 stock_unit_id=su.stock_unit_id,
                 source='IN_TRANSIT',
-                quantity=su.quantity,
+                quantity=available_quantity,
+                business_unit_id=su.business_unit_id,
                 material_type=mtype.name,
                 can_split=not is_roll,
                 expected_arrival_date=su.expected_arrival_date,
@@ -206,13 +293,27 @@ def preview_simulation(
     actor: PolicyActor | None = None,
 ) -> SimulationPreviewResult:
     """Run a read-only simulation."""
-    policy_engine.require(actor or system_actor(), "simulation.run")
+    acting_actor = actor or system_actor()
+    policy_engine.require(acting_actor, "simulation.run")
 
     if request.include_in_transit and request.target_date is None:
         raise ValidationException("target_date is required when including in-transit stock.")
 
     if not request.fgpns:
         raise ValidationException("At least one FGPN is required for simulation.")
+
+    project = simulation_repository.get_project(db, request.project_id)
+    if project is None:
+        raise ValidationException(f"Project {request.project_id} not found.")
+    if project.status != "Active":
+        raise ValidationException(f"Project {request.project_id} is not active.")
+    if (
+        acting_actor.normalized_role == "LAUNCH_ENGINEER"
+        and acting_actor.user_id is not None
+        and acting_actor.user_id != project.launch_engineer_user_id
+    ):
+        raise ValidationException("Launch engineers may simulate only their assigned project.")
+
     stock_scope_mode = _normalize_stock_scope_mode(request.stock_scope_mode)
     if stock_scope_mode == "OWNED_ONLY":
         if request.stock_owner_user_id is None:
@@ -222,6 +323,16 @@ def preview_simulation(
             raise ValidationException(f"Stock owner user {request.stock_owner_user_id} not found.")
         if not stock_repository.is_affectable_stock_owner(stock_owner):
             raise ValidationException("Owned-only simulation owner must be a launch engineer or launch manager.")
+        if request.stock_owner_user_id != project.launch_engineer_user_id:
+            raise ValidationException(
+                "Owned-only stock must belong to the launch engineer assigned to the selected project."
+            )
+        if (
+            acting_actor.normalized_role == "LAUNCH_ENGINEER"
+            and acting_actor.user_id is not None
+            and request.stock_owner_user_id != acting_actor.user_id
+        ):
+            raise ValidationException("Launch engineers may use only their own assigned stock.")
         
     fgpn_ids = [f.fgpn_id for f in request.fgpns]
     po_line_ids = [f.po_line_id for f in request.fgpns if f.po_line_id is not None]
@@ -234,6 +345,20 @@ def preview_simulation(
         db,
         po_fgpn_pairs,
     )
+
+    resolved_po_lines = []
+    for req in request.fgpns:
+        line = (
+            po_lines_db.get(req.po_line_id)
+            if req.po_line_id is not None
+            else current_po_lines_db.get((req.po_id, req.fgpn_id))
+        )
+        if line is not None:
+            resolved_po_lines.append(line)
+    planned_by_line = simulation_repository.get_planned_launch_quantities_by_po_line(
+        db,
+        [line.po_line_id for line in resolved_po_lines],
+    )
     
     # 1. Build Demands
     demands = []
@@ -242,6 +367,10 @@ def preview_simulation(
             raise ValidationException(f"FGPN {req.fgpn_id} not found.")
         if req.fgpn_id not in boms:
             raise ValidationException(f"No current BOM found for FGPN {req.fgpn_id}.")
+        if fgpns_db[req.fgpn_id].project_id != request.project_id:
+            raise ValidationException(
+                f"FGPN {req.fgpn_id} does not belong to project {request.project_id}."
+            )
         po_line = (
             po_lines_db.get(req.po_line_id)
             if req.po_line_id is not None
@@ -258,25 +387,35 @@ def preview_simulation(
                 f"PO line {req.po_line_id} does not belong to FGPN {req.fgpn_id}."
             )
         if po_line.po_version is not None and po_line.po_version.purchase_order is not None:
-            resolved_po_id = po_line.po_version.purchase_order.po_id
+            resolved_po = po_line.po_version.purchase_order
+            resolved_po_id = resolved_po.po_id
             if resolved_po_id != req.po_id:
                 raise ValidationException(
                     f"PO line {po_line.po_line_id} does not belong to PO {req.po_id}."
                 )
+            if resolved_po.current_version_id != po_line.po_version_id:
+                raise ValidationException(
+                    f"PO line {po_line.po_line_id} is not part of the current PO version."
+                )
+
+        already_planned = planned_by_line.get(po_line.po_line_id, Decimal("0"))
+        outstanding = max(Decimal("0"), po_line.ordered_quantity - already_planned)
+        if req.requested_quantity > outstanding:
+            raise ValidationException(
+                f"Requested quantity {req.requested_quantity} exceeds outstanding quantity "
+                f"{outstanding} for PO line {po_line.po_line_id}."
+            )
             
         bom = boms[req.fgpn_id]
         fgpn = fgpns_db[req.fgpn_id]
         po_quantity = po_line.ordered_quantity if po_line is not None else req.requested_quantity
-        priority = request_index
+        priority = req.priority
         po_number = None
         if po_line is not None and po_line.po_version is not None:
             po = po_line.po_version.purchase_order
             po_number = po.po_number if po is not None else None
         
-        # Calculate simulation qty based on strategy
         sim_qty = req.requested_quantity
-        if request.allocation_strategy in ('MANUAL', 'PRIORITY_PLUS_MANUAL') and req.manual_quantity is not None:
-            sim_qty = req.manual_quantity
             
         demand = FgpnDemand(
             fgpn_id=req.fgpn_id,
@@ -305,6 +444,11 @@ def preview_simulation(
             if mat_qty > 0:
                 current = demand.material_demands.get(line.material_part_number, Decimal('0'))
                 demand.material_demands[line.material_part_number] = current + mat_qty
+
+        if not demand.material_demands:
+            raise ValidationException(
+                f"Current BOM for FGPN {req.fgpn_id} has no positive material demand."
+            )
                 
         demands.append(demand)
         
@@ -322,7 +466,7 @@ def preview_simulation(
         pools = _build_pools(db, request.include_in_transit, target_date=request.target_date)
     
     # 3. Run Allocator
-    demands, allocations = run_allocation_engine(demands, pools, request.allocation_strategy)
+    demands, allocations = run_allocation_engine(demands, pools)
     
     # 4. Format Results
     mat_map = {m.material_part_number: (m, mt) for m, mt in stock_repository.get_all_materials(db) if m.material_part_number}
@@ -345,7 +489,7 @@ def preview_simulation(
                 m, mt = mat_map.get(mpn, (None, None))
                 mat_summaries[mpn] = {
                     'description': m.description if m else 'Unknown',
-                    'unit': mt.unit if mt else 'pcs',
+                    'unit': _simulation_unit(mt.unit if mt else None),
                     'total_demand': Decimal('0'),
                     'allocated_quantity': Decimal('0'),
                     'shortfall': Decimal('0')
@@ -407,14 +551,7 @@ def preview_simulation(
             suggestion=_fgpn_suggestion(status, d.launchable_quantity, d.requested_quantity)
         ))
         
-    # Format Allocation Details
     alloc_details = []
-    for fgpn_code, slot, qty in allocations:
-        # Note: the UI wants per-material allocation details, not necessarily per-FGPN,
-        # but our allocator tracks it per-slot.
-        pass # We'll just group by slot
-        
-    # Group allocations by slot
     slot_allocs = {}
     for _, slot, qty in allocations:
         key = id(slot)
@@ -425,9 +562,6 @@ def preview_simulation(
             }
         slot_allocs[key]['allocated'] += qty
         
-    # In order to know material part number for a slot, we need to find it in the pools
-    # A faster way: just pass mpn through the allocator. Let's fix that.
-    # Actually, we can just look it up.
     slot_to_mpn = {}
     for mpn, pool in pools.items():
         for s in pool.all_slots():
@@ -438,6 +572,7 @@ def preview_simulation(
         mpn = slot_to_mpn.get(key, "Unknown")
         alloc_details.append(AllocationDetail(
             stock_unit_id=slot.stock_unit_id,
+            business_unit_id=slot.business_unit_id,
             material_part_number=mpn,
             source=slot.source,
             assigned_user_id=slot.assigned_user_id,
@@ -460,7 +595,6 @@ def preview_simulation(
         stock_scope_mode=stock_scope_mode,
         stock_owner_user_id=request.stock_owner_user_id if stock_scope_mode == "OWNED_ONLY" else None,
         include_global_stock=request.include_global_stock if stock_scope_mode == "OWNED_ONLY" else False,
-        allocation_strategy=request.allocation_strategy,
         is_feasible=is_feasible,
         total_requested_quantity=total_requested,
         total_launchable_quantity=total_launchable,
@@ -492,6 +626,13 @@ def save_simulation(
         raise ValidationException("Preview and save target dates must match.")
     preview_request = request.preview_request.model_copy(update={"target_date": request.target_date})
     preview = preview_simulation(db, preview_request, actor=acting_actor)
+    stock_repository.lock_stock_units_for_materials(
+        db,
+        [material.material_part_number for material in preview.material_summaries],
+    )
+    # Re-run after acquiring the material locks so a competing save cannot reserve
+    # quantities calculated before the first transaction committed.
+    preview = preview_simulation(db, preview_request, actor=acting_actor)
     
     # Extract shortfalls
     shortfalls = {}
@@ -512,11 +653,11 @@ def save_simulation(
             
     sim_id = simulation_repository.save_simulation(
         db,
+        project_id=request.preview_request.project_id,
         simulation_mode=preview.stock_scope,
         stock_scope_mode=preview.stock_scope_mode,
         stock_owner_user_id=preview.stock_owner_user_id,
         include_global_stock=preview.include_global_stock,
-        allocation_strategy=preview.allocation_strategy,
         target_date=request.target_date,
         safety_coefficient=request.preview_request.safety_coefficient,
         is_feasible=preview.is_feasible,
@@ -539,25 +680,103 @@ def save_simulation(
     )
     
     db.commit()
-    return SimulationSaveResponse(simulation_id=sim_id)
+    saved = simulation_repository.get_simulation(db, sim_id)
+    return SimulationSaveResponse(
+        simulation_id=sim_id,
+        status=saved.workflow_status,
+        document_due_at=saved.document_due_at,
+    )
+
+
+def attach_meeting_document(
+    db: Session,
+    simulation_id: int,
+    document_id: int,
+    *,
+    actor: PolicyActor | None = None,
+) -> SimulationWorkflowResponse:
+    """Attach the required PV while its reservation is active."""
+    acting_actor = actor or system_actor()
+    policy_engine.require(acting_actor, "simulation.run")
+    simulation = simulation_repository.get_simulation_for_update(db, simulation_id)
+    if simulation is None:
+        raise NotFoundException(f"Simulation {simulation_id} not found.")
+    if simulation.workflow_status == "LAUNCHED":
+        raise ConflictException("A launched simulation cannot change its meeting document.")
+    if simulation.workflow_status == "RELEASED" or (
+        simulation.document_due_at is not None
+        and simulation.document_due_at <= datetime.now()
+    ):
+        _release_reservation_rows(simulation)
+        db.commit()
+        raise ConflictException(
+            "The 24-hour document window expired. Run and save a new simulation."
+        )
+
+    document = db.get(Document, document_id)
+    if document is None:
+        raise NotFoundException(f"Document {document_id} not found.")
+    if document.document_type != "MTG_MINUTES":
+        raise ValidationException("The attached document must have type MTG_MINUTES.")
+
+    simulation.mtg_minutes_document_id = document_id
+    simulation.workflow_status = "READY"
+    simulation.document_due_at = None
+    db.commit()
+    return SimulationWorkflowResponse(simulation_id=simulation_id, status="READY")
+
+
+def _release_reservation_rows(simulation) -> None:
+    simulation.workflow_status = "RELEASED"
+    for allocation in simulation.stock_allocations:
+        if allocation.allocation_type == "SIMULATION" and allocation.status == "RESERVED":
+            allocation.status = "RELEASED"
+
+
+def release_expired_reservation(
+    db: Session,
+    simulation_id: int,
+    *,
+    actor: PolicyActor | None = None,
+) -> SimulationWorkflowResponse:
+    """Release an expired reservation; never reverse an executed launch."""
+    acting_actor = actor or system_actor()
+    policy_engine.require(acting_actor, "simulation.run")
+    simulation = simulation_repository.get_simulation_for_update(db, simulation_id)
+    if simulation is None:
+        raise NotFoundException(f"Simulation {simulation_id} not found.")
+    if simulation.workflow_status == "LAUNCHED":
+        return SimulationWorkflowResponse(simulation_id=simulation_id, status="LAUNCHED")
+    if simulation.mtg_minutes_document_id is not None:
+        return SimulationWorkflowResponse(simulation_id=simulation_id, status=simulation.workflow_status)
+    if simulation.document_due_at is None or simulation.document_due_at > datetime.now():
+        raise ConflictException("The document window is still active; the reservation cannot be released yet.")
+    _release_reservation_rows(simulation)
+    db.commit()
+    return SimulationWorkflowResponse(simulation_id=simulation_id, status="RELEASED")
 
 
 def _saved_simulation_preview_request(
     simulation,
     selected_fgpns,
+    *,
+    for_launch: bool = False,
 ) -> SimulationPreviewRequest:
     return SimulationPreviewRequest(
+        project_id=simulation.project_id,
         fgpns=[
             FgpnSimulationRequest(
                 po_id=row.po_id,
                 fgpn_id=row.fgpn_id,
                 po_line_id=row.po_line_id,
+                priority=row.priority,
                 requested_quantity=row.simulation_quantity,
             )
             for row in selected_fgpns
         ],
-        allocation_strategy=simulation.allocation_strategy,
-        include_in_transit=simulation.simulation_mode == 'INCLUDING_IN_TRANSIT',
+        include_in_transit=(
+            simulation.simulation_mode == 'INCLUDING_IN_TRANSIT' and not for_launch
+        ),
         target_date=simulation.target_date,
         safety_coefficient=simulation.safety_coefficient,
         stock_scope_mode=simulation.stock_scope_mode,
@@ -613,13 +832,18 @@ def _find_unavailable_saved_allocations(
             continue
 
         reason = None
-        if not stock_repository.is_stock_unit_available_for_quantity(stock_unit, alloc.allocated_quantity):
+        if alloc.status != "RESERVED":
+            reason = "The saved reservation is no longer active."
+        elif alloc.source_location == "PRODUCTION":
+            consumed = stock_repository.get_cutting_consumption_by_stock_unit(db).get(
+                stock_unit.stock_unit_id, Decimal("0")
+            )
+            if stock_unit.status != "PRODUCTION" or stock_unit.quantity - consumed < alloc.allocated_quantity:
+                reason = "The identified production remainder is no longer available."
+        elif stock_unit.status == "IN_TRANSIT":
+            reason = "Supplier ETA is planning information; warehouse arrival must be confirmed before launch."
+        elif not stock_repository.is_stock_unit_available_for_quantity(stock_unit, alloc.allocated_quantity):
             reason = "Stock unit was already consumed, moved, or no longer has enough quantity."
-        elif stock_unit.status == 'IN_TRANSIT' and (
-            stock_unit.expected_arrival_date is None
-            or stock_unit.expected_arrival_date.date() > target_date
-        ):
-            reason = "In-transit stock has no confirmed arrival on or before the simulation target date."
         if reason:
             issues.append(LaunchAvailabilityIssue(
                 stock_unit_id=stock_unit.stock_unit_id,
@@ -645,6 +869,34 @@ def review_simulation_for_launch(
     simulation = simulation_repository.get_simulation(db, simulation_id)
     if simulation is None:
         raise NotFoundException(f"Simulation {simulation_id} not found.")
+    if simulation.workflow_status == "AWAITING_DOCUMENT":
+        if simulation.document_due_at is not None and simulation.document_due_at <= datetime.now():
+            return LaunchReviewResult(
+                simulation_id=simulation_id,
+                can_launch=False,
+                original_allocations_available=False,
+                message="The 24-hour meeting-document window expired; save a new simulation.",
+            )
+        return LaunchReviewResult(
+            simulation_id=simulation_id,
+            can_launch=False,
+            original_allocations_available=True,
+            message="Attach the meeting document before launching this simulation.",
+        )
+    if simulation.workflow_status == "RELEASED":
+        return LaunchReviewResult(
+            simulation_id=simulation_id,
+            can_launch=False,
+            original_allocations_available=False,
+            message="This reservation was released; save a new simulation.",
+        )
+    if simulation.workflow_status == "LAUNCHED":
+        return LaunchReviewResult(
+            simulation_id=simulation_id,
+            can_launch=True,
+            original_allocations_available=True,
+            message="This simulation was already launched.",
+        )
 
     simulation_allocations = simulation_repository.get_simulation_allocations(
         db,
@@ -663,7 +915,7 @@ def review_simulation_for_launch(
     selected_fgpns = simulation_repository.get_simulation_selected_fgpns(db, simulation_id)
     replacement_preview = preview_simulation(
         db,
-        _saved_simulation_preview_request(simulation, selected_fgpns),
+        _saved_simulation_preview_request(simulation, selected_fgpns, for_launch=True),
         actor=acting_actor,
     )
     if replacement_preview.is_feasible:
@@ -698,6 +950,30 @@ def launch_saved_simulation(
     acting_actor = actor or system_actor()
     policy_engine.require(acting_actor, "launch.manage")
 
+    simulation = simulation_repository.get_simulation_for_update(db, simulation_id)
+    if simulation is None:
+        raise NotFoundException(f"Simulation {simulation_id} not found.")
+    if simulation.launched_at is not None or simulation.workflow_status == "LAUNCHED":
+        existing = simulation_repository.get_simulation_allocations(
+            db, simulation_id, allocation_type="LAUNCH",
+        )
+        return LaunchSimulationResponse(
+            simulation_id=simulation_id,
+            status="LAUNCHED",
+            launch_allocation_count=len(existing),
+            idempotent_replay=True,
+        )
+    if simulation.workflow_status == "AWAITING_DOCUMENT":
+        if simulation.document_due_at is not None and simulation.document_due_at <= datetime.now():
+            _release_reservation_rows(simulation)
+            db.commit()
+            raise ConflictException(
+                "The meeting document was not attached within 24 hours; the reservation was released."
+            )
+        raise ConflictException("Attach the meeting document before launching this simulation.")
+    if simulation.workflow_status == "RELEASED":
+        raise ConflictException("This reservation was released; run and save a new simulation.")
+
     review = review_simulation_for_launch(db, simulation_id, actor=acting_actor)
     if not review.can_launch:
         raise ConflictException(
@@ -719,8 +995,14 @@ def launch_saved_simulation(
     stock_units = stock_repository.get_stock_units_by_ids(
         db,
         [alloc['stock_unit_id'] for alloc in launch_allocations],
+        for_update=True,
     )
     actual_launch_allocations = []
+    if acting_actor.user_id is not None:
+        movement_actor_user_id = acting_actor.user_id
+    else:
+        from app.repositories.bom_repository import _get_system_user
+        movement_actor_user_id = _get_system_user(db)
     for alloc in launch_allocations:
         stock_unit = stock_units.get(alloc['stock_unit_id'])
         if stock_unit is None:
@@ -728,12 +1010,32 @@ def launch_saved_simulation(
                 f"Cannot launch: StockUnit {alloc['stock_unit_id']} no longer exists."
             )
         try:
-            issued_stock_unit = stock_repository.issue_stock_unit_to_production(
-                db,
-                stock_unit,
-                alloc['allocated_quantity'],
-                is_whole_issue=alloc['is_whole_issue'],
-            )
+            source_status = stock_unit.status
+            if alloc['source_location'] == "PRODUCTION":
+                if stock_unit.status != "PRODUCTION":
+                    raise ValueError(
+                        f"Production StockUnit {stock_unit.stock_unit_id} is no longer in production."
+                    )
+                issued_stock_unit = stock_unit
+            else:
+                issued_stock_unit = stock_repository.issue_stock_unit_to_production(
+                    db,
+                    stock_unit,
+                    alloc['allocated_quantity'],
+                    is_whole_issue=alloc['is_whole_issue'],
+                )
+                stock_movement_service.record_movement(
+                    db,
+                    material_part_number=stock_unit.material_part_number,
+                    movement_type="STOCK_ISSUED_TO_PRODUCTION",
+                    quantity_change=-alloc['allocated_quantity'],
+                    actor_user_id=movement_actor_user_id,
+                    stock_unit_id=issued_stock_unit.stock_unit_id,
+                    stock_unit_reference=issued_stock_unit.business_unit_id,
+                    from_status=source_status,
+                    to_status="ISSUED_TO_PRODUCTION",
+                    note=f"Simulation {simulation_id} launch allocation.",
+                )
             actual_launch_allocations.append({
                 **alloc,
                 'stock_unit_id': issued_stock_unit.stock_unit_id,
@@ -746,8 +1048,13 @@ def launch_saved_simulation(
         simulation_id=simulation_id,
         allocations=actual_launch_allocations,
         allocation_type='LAUNCH',
-        status='ISSUED_TO_PRODUCTION',
+        status='COMMITTED',
     )
+    simulation.launched_at = datetime.now()
+    simulation.workflow_status = "LAUNCHED"
+    for allocation in simulation.stock_allocations:
+        if allocation.allocation_type == "SIMULATION" and allocation.status == "RESERVED":
+            allocation.status = "RELEASED"
     db.commit()
 
     return LaunchSimulationResponse(

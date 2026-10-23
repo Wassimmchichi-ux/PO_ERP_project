@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import uuid
 import asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from pathlib import Path
@@ -32,6 +32,7 @@ from app.models import (
     PurchaseOrderLine,
     PurchaseOrderVersion,
     StockUnit,
+    Supplier,
     User,
 )
 from app.models.cutting_consumption import CuttingConsumption
@@ -45,7 +46,7 @@ from app.schemas.simulation import (
 )
 from app.schemas.stock import StockUnitReceptionRequest
 from app.services import bom_extraction_service, material_simulation_service, stock_management_service
-from app.exceptions.base import ValidationException
+from app.exceptions.base import ConflictException, ValidationException
 from app.utils.bom_workbook_extractor import ParsedBom, parse_bom_workbook_many
 
 
@@ -103,13 +104,24 @@ def seeded_db(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> dict[str,
         must_change_password=False,
         created_at=now,
     )
-    db_session.add_all([user, launch_engineer])
+    db_session.add_all([
+        user,
+        launch_engineer,
+        Supplier(
+            supplier_id=1,
+            supplier_reference="SUP-001",
+            full_name="Atlas Technical Textiles",
+            status="Active",
+            created_at=now,
+            updated_at=now,
+        ),
+    ])
 
     project = Project(
         project_id=1,
         project_code="P-2261",
         name="Covers B-SUV Seat Trim",
-        launch_engineer_user_id=TEST_USER_ID,
+        launch_engineer_user_id=LAUNCH_ENGINEER_ID,
         status="Active",
         created_at=now,
         updated_at=now,
@@ -316,10 +328,10 @@ def test_preview_simulation_feasible_with_mbom_bom_and_stock_units(
     result = material_simulation_service.preview_simulation(
         db_session,
         SimulationPreviewRequest(
+            project_id=1,
             fgpns=[
-                FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("10")),
+                FgpnSimulationRequest(po_id=1, fgpn_id=1, priority=1, requested_quantity=Decimal("10")),
             ],
-            allocation_strategy="PRIORITY",
             include_in_transit=False,
             safety_coefficient=Decimal("1"),
         ),
@@ -348,10 +360,10 @@ def test_preview_simulation_shortfall_with_mbom_bom_and_partial_stock(
     result = material_simulation_service.preview_simulation(
         db_session,
         SimulationPreviewRequest(
+            project_id=1,
             fgpns=[
-                FgpnSimulationRequest(po_id=2, fgpn_id=2, requested_quantity=Decimal("20")),
+                FgpnSimulationRequest(po_id=2, fgpn_id=2, priority=1, requested_quantity=Decimal("20")),
             ],
-            allocation_strategy="PRIORITY",
             include_in_transit=False,
             safety_coefficient=Decimal("1"),
         ),
@@ -461,10 +473,10 @@ def test_owned_simulation_can_include_or_exclude_global_stock(
     all_stock_result = material_simulation_service.preview_simulation(
         db_session,
         SimulationPreviewRequest(
+            project_id=1,
             fgpns=[
-                FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("4")),
+                FgpnSimulationRequest(po_id=1, fgpn_id=1, priority=1, requested_quantity=Decimal("4")),
             ],
-            allocation_strategy="PRIORITY",
             include_in_transit=False,
             safety_coefficient=Decimal("1"),
         ),
@@ -472,10 +484,10 @@ def test_owned_simulation_can_include_or_exclude_global_stock(
     owner_only_result = material_simulation_service.preview_simulation(
         db_session,
         SimulationPreviewRequest(
+            project_id=1,
             fgpns=[
-                FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("4")),
+                FgpnSimulationRequest(po_id=1, fgpn_id=1, priority=1, requested_quantity=Decimal("4")),
             ],
-            allocation_strategy="PRIORITY",
             include_in_transit=False,
             safety_coefficient=Decimal("1"),
             stock_scope_mode="OWNED_ONLY",
@@ -485,10 +497,10 @@ def test_owned_simulation_can_include_or_exclude_global_stock(
     owner_plus_global_result = material_simulation_service.preview_simulation(
         db_session,
         SimulationPreviewRequest(
+            project_id=1,
             fgpns=[
-                FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("4")),
+                FgpnSimulationRequest(po_id=1, fgpn_id=1, priority=1, requested_quantity=Decimal("4")),
             ],
-            allocation_strategy="PRIORITY",
             include_in_transit=False,
             safety_coefficient=Decimal("1"),
             stock_scope_mode="OWNED_ONLY",
@@ -537,10 +549,10 @@ def test_save_simulation_does_not_create_launch_until_meeting_approval(
             target_date=date(2026, 8, 25),
             mtg_minutes_document_id=seeded_db["meeting_document_id"],
             preview_request=SimulationPreviewRequest(
+                project_id=1,
                 fgpns=[
-                    FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("5")),
+                    FgpnSimulationRequest(po_id=1, fgpn_id=1, priority=1, requested_quantity=Decimal("5")),
                 ],
-                allocation_strategy="PRIORITY",
                 include_in_transit=False,
                 safety_coefficient=Decimal("1"),
             ),
@@ -551,6 +563,124 @@ def test_save_simulation_does_not_create_launch_until_meeting_approval(
     assert response.simulation_id is not None
     assert db_session.execute(select(func.count(Simulation.simulation_id))).scalar_one() == 1
     assert db_session.execute(select(func.count(Launch.launch_id))).scalar_one() == 0
+
+
+def test_missing_meeting_document_reservation_expires_after_24_hours(
+    db_session: Session,
+    seeded_db: dict[str, int | uuid.UUID],
+) -> None:
+    parsed = _parsed_mbom_for_fgpn(FGPN_CODES[0])
+    _insert_stock_for_requirements(
+        db_session,
+        _requirements_for(parsed, Decimal("5")),
+        quantity_factor=Decimal("1.2"),
+    )
+    response = material_simulation_service.save_simulation(
+        db_session,
+        SimulationSaveRequest(
+            target_date=date(2026, 8, 25),
+            preview_request=SimulationPreviewRequest(
+                project_id=1,
+                fgpns=[FgpnSimulationRequest(
+                    po_id=1,
+                    fgpn_id=1,
+                    priority=1,
+                    requested_quantity=Decimal("5"),
+                )],
+                safety_coefficient=Decimal("1"),
+            ),
+        ),
+        user_id=str(seeded_db["user_id"]),
+    )
+    simulation = db_session.get(Simulation, response.simulation_id)
+    assert response.status == "AWAITING_DOCUMENT"
+    assert simulation.document_due_at is not None
+    simulation.document_due_at = datetime.now() - timedelta(seconds=1)
+    db_session.commit()
+
+    review = material_simulation_service.review_simulation_for_launch(
+        db_session, response.simulation_id,
+    )
+    assert review.can_launch is False
+    assert "expired" in review.message
+
+    with pytest.raises(ConflictException, match="reservation was released"):
+        material_simulation_service.launch_saved_simulation(
+            db_session, response.simulation_id,
+        )
+    db_session.refresh(simulation)
+    allocations = db_session.scalars(
+        select(StockAllocation).where(
+            StockAllocation.simulation_id == response.simulation_id,
+            StockAllocation.allocation_type == "SIMULATION",
+        )
+    ).all()
+    assert simulation.workflow_status == "RELEASED"
+    assert allocations and {row.status for row in allocations} == {"RELEASED"}
+
+
+def test_preview_rejects_quantity_above_current_po_outstanding_demand(
+    db_session: Session,
+    seeded_db: dict[str, int | uuid.UUID],
+) -> None:
+    with pytest.raises(ValidationException, match="exceeds outstanding quantity"):
+        material_simulation_service.preview_simulation(
+            db_session,
+            SimulationPreviewRequest(
+                project_id=1,
+                fgpns=[FgpnSimulationRequest(
+                    po_id=1,
+                    fgpn_id=1,
+                    po_line_id=1,
+                    priority=1,
+                    requested_quantity=Decimal("101"),
+                )],
+                safety_coefficient=Decimal("1"),
+            ),
+        )
+
+
+def test_preview_rejects_an_explicit_line_from_an_older_po_version(
+    db_session: Session,
+    seeded_db: dict[str, int | uuid.UUID],
+) -> None:
+    db_session.add(PurchaseOrderVersion(
+        po_version_id=10,
+        po_id=1,
+        version_number=2,
+        document_id=100,
+        created_at=datetime.now(),
+        created_by=TEST_USER_ID,
+    ))
+    db_session.add(PurchaseOrderLine(
+        po_line_id=10,
+        po_version_id=10,
+        line_number=1,
+        fgpn_id=1,
+        ordered_quantity=Decimal("100"),
+        unit_price=Decimal("0"),
+        delivery_method_id=1,
+        created_at=datetime.now(),
+    ))
+    db_session.flush()
+    db_session.get(PurchaseOrder, 1).current_version_id = 10
+    db_session.commit()
+
+    with pytest.raises(ValidationException, match="not part of the current PO version"):
+        material_simulation_service.preview_simulation(
+            db_session,
+            SimulationPreviewRequest(
+                project_id=1,
+                fgpns=[FgpnSimulationRequest(
+                    po_id=1,
+                    fgpn_id=1,
+                    po_line_id=1,
+                    priority=1,
+                    requested_quantity=Decimal("5"),
+                )],
+                safety_coefficient=Decimal("1"),
+            ),
+        )
 
 
 def test_saved_simulation_can_be_promoted_to_launch_record(
@@ -570,10 +700,10 @@ def test_saved_simulation_can_be_promoted_to_launch_record(
             target_date=date(2026, 8, 25),
             mtg_minutes_document_id=seeded_db["meeting_document_id"],
             preview_request=SimulationPreviewRequest(
+                project_id=1,
                 fgpns=[
-                    FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("5")),
+                    FgpnSimulationRequest(po_id=1, fgpn_id=1, priority=1, requested_quantity=Decimal("5")),
                 ],
-                allocation_strategy="PRIORITY",
                 include_in_transit=False,
                 safety_coefficient=Decimal("1"),
             ),
@@ -634,10 +764,10 @@ def test_launch_saved_simulation_splits_component_stock_and_handover_moves_to_pr
             target_date=date(2026, 8, 25),
             mtg_minutes_document_id=seeded_db["meeting_document_id"],
             preview_request=SimulationPreviewRequest(
+                project_id=1,
                 fgpns=[
-                    FgpnSimulationRequest(po_id=1, fgpn_id=1, requested_quantity=Decimal("5")),
+                    FgpnSimulationRequest(po_id=1, fgpn_id=1, priority=1, requested_quantity=Decimal("5")),
                 ],
-                allocation_strategy="PRIORITY",
                 include_in_transit=False,
                 safety_coefficient=Decimal("1"),
             ),
@@ -646,6 +776,10 @@ def test_launch_saved_simulation_splits_component_stock_and_handover_moves_to_pr
     )
 
     launch_response = material_simulation_service.launch_saved_simulation(
+        db_session,
+        response.simulation_id,
+    )
+    replay_response = material_simulation_service.launch_saved_simulation(
         db_session,
         response.simulation_id,
     )
@@ -660,6 +794,9 @@ def test_launch_saved_simulation_splits_component_stock_and_handover_moves_to_pr
     ).scalars().all()
 
     assert launch_response.status == "LAUNCHED"
+    assert replay_response.status == "LAUNCHED"
+    assert replay_response.idempotent_replay is True
+    assert replay_response.launch_allocation_count == launch_response.launch_allocation_count
     assert issued_children
     assert all(child.status == "ISSUED_TO_PRODUCTION" for child in issued_children)
     assert any(parent.quantity > 0 for parent in (child.parent_stock_unit for child in issued_children))

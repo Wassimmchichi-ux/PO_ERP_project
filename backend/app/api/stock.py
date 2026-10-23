@@ -12,6 +12,7 @@ from app.policies import PolicyActor, policy_engine
 from app.schemas.stock import (
     ExpectedArrivalUpdateRequest,
     InTransitItem,
+    StockSummaryItem,
     StockSummaryListResponse,
     ProductionStockListResponse,
     InTransitListResponse,
@@ -21,6 +22,11 @@ from app.schemas.stock import (
     StockDashboardStats,
     StockUnitReceptionRequest,
     StockUnitReceptionResponse,
+    StockUnitReceptionBatchRequest,
+    StockUnitReceptionBatchResponse,
+    MaterialThresholdUpdateRequest,
+    StockMovementListResponse,
+    StockReceptionCorrectionRequest,
 )
 from app.services import stock_management_service
 
@@ -59,6 +65,42 @@ def record_stock_unit_reception(
     )
 
 
+@router.patch("/units/{stock_unit_id}/reception", response_model=StockUnitReceptionResponse)
+def correct_stock_unit_reception(
+    stock_unit_id: int,
+    request: StockReceptionCorrectionRequest,
+    db: Annotated[Session, Depends(get_db)],
+    actor: Annotated[PolicyActor, Depends(get_current_policy_actor)],
+) -> StockUnitReceptionResponse:
+    """Correct a received stock unit while preserving the original value in history."""
+    return stock_management_service.correct_stock_unit_reception(
+        db,
+        stock_unit_id,
+        request,
+        actor_user_id_or_system(db, actor),
+        actor=actor,
+    )
+
+
+@router.post(
+    "/units/receptions",
+    response_model=StockUnitReceptionBatchResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def record_stock_unit_receptions(
+    request: StockUnitReceptionBatchRequest,
+    db: Annotated[Session, Depends(get_db)],
+    actor: Annotated[PolicyActor, Depends(get_current_policy_actor)],
+) -> StockUnitReceptionBatchResponse:
+    """Receive a physical batch as individually generated stock units."""
+    return stock_management_service.record_stock_unit_receptions(
+        db,
+        request,
+        actor_user_id_or_system(db, actor),
+        actor=actor,
+    )
+
+
 @router.get("/summary", response_model=StockSummaryListResponse)
 def get_stock_summary(
     db: Annotated[Session, Depends(get_db)],
@@ -66,6 +108,42 @@ def get_stock_summary(
     """Get aggregated material availability across warehouse, production, and in-transit."""
     items = stock_management_service.get_stock_summary(db)
     return StockSummaryListResponse(items=items, total=len(items))
+
+
+@router.patch("/materials/{material_part_number}/threshold", response_model=StockSummaryItem)
+def update_material_threshold(
+    material_part_number: str,
+    request: MaterialThresholdUpdateRequest,
+    db: Annotated[Session, Depends(get_db)],
+    actor: Annotated[PolicyActor, Depends(get_current_policy_actor)],
+) -> StockSummaryItem:
+    """Persist the critical stock threshold maintained by launch engineering."""
+    return stock_management_service.update_material_threshold(
+        db,
+        material_part_number,
+        request,
+        actor_user_id_or_system(db, actor),
+        actor=actor,
+    )
+
+
+@router.get("/history", response_model=StockMovementListResponse)
+def get_stock_history(
+    db: Annotated[Session, Depends(get_db)],
+    actor: Annotated[PolicyActor, Depends(get_current_policy_actor)],
+    movement_type: Optional[str] = Query(None),
+    material_part_number: Optional[str] = Query(None),
+    limit: int = Query(500, ge=1, le=1000),
+) -> StockMovementListResponse:
+    """Read the immutable movement ledger shared by all stock workflows."""
+    policy_engine.require(actor, "stock.view")
+    items = stock_management_service.get_stock_history(
+        db,
+        movement_type=movement_type,
+        material_part_number=material_part_number,
+        limit=limit,
+    )
+    return StockMovementListResponse(items=items, total=len(items))
 
 
 @router.get("/production", response_model=ProductionStockListResponse)
@@ -127,5 +205,6 @@ def confirm_production_handover(
         stock_unit_id,
         request.handover_document_id,
         actor=actor,
+        actor_user_id=actor_user_id_or_system(db, actor),
     )
     return ProductionHandoverResponse(stock_unit_id=stock_unit_id, material_detail=detail)

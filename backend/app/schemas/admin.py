@@ -24,6 +24,7 @@ ReferenceListName = Literal[
     "manufacturing-receivers",
     "delivery-methods",
     "material-types",
+    "suppliers",
 ]
 
 
