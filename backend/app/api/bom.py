@@ -19,13 +19,14 @@ from __future__ import annotations
 import logging
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.dependencies.auth import get_current_policy_actor
 from app.dependencies.db import get_db
 from app.policies import PolicyActor
-from app.schemas.bom import BomUploadResult
+from app.schemas.bom import BomUploadResult, BomVersionResponse
+from app.services import bom_extraction_service
 from app.services.bom_extraction_service import upload_bom_files
 
 logger = logging.getLogger(__name__)
@@ -96,3 +97,49 @@ async def upload_bom(
         project_id=project_id,
         actor=actor,
     )
+
+
+
+@router.get("", response_model=list[BomVersionResponse])
+def list_boms(
+    db: Annotated[Session, Depends(get_db)],
+    actor: Annotated[PolicyActor, Depends(get_current_policy_actor)],
+    project_id: Annotated[Optional[int], Query(description="Filter BOMs by project ID")] = None,
+) -> list[BomVersionResponse]:
+    """List all stored BOM versions and their extracted material lines."""
+    return bom_extraction_service.list_boms(db, project_id=project_id, actor=actor)
+
+
+@router.get("/{bom_id}/download")
+def download_bom(
+    bom_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    actor: Annotated[PolicyActor, Depends(get_current_policy_actor)],
+):
+    """Download the original uploaded Excel workbook for a BOM."""
+    filename, content = bom_extraction_service.get_bom_file_content(db, bom_id, actor=actor)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+@router.get("/template/{fgpn}")
+def download_fgpn_template(
+    fgpn: str,
+    actor: Annotated[PolicyActor, Depends(get_current_policy_actor)],
+):
+    """Download sample / template MBOM Excel workbook for a specific FGPN."""
+    from pathlib import Path
+    from fastapi import HTTPException
+    for base in [Path("/app/uploads/sample_mbom"), Path("backend/uploads/sample_mbom"), Path("ressources/mbom_files/single_fgpn")]:
+        file_path = base / f"MBOM_{fgpn}.xlsx"
+        if file_path.exists():
+            with open(file_path, "rb") as f:
+                content = f.read()
+            return Response(
+                content=content,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": f'attachment; filename="MBOM_{fgpn}.xlsx"'},
+            )
+    raise HTTPException(status_code=404, detail=f"No template found for FGPN {fgpn}")

@@ -100,6 +100,8 @@ class BomVersionResponse(BaseModel):
     notes: Optional[str] = None
     document: Optional[BomDocumentResponse] = None
     material_lines: list[BomMaterialLineResponse] = []
+    project_id: Optional[int] = None
+    project_code: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -59,6 +59,12 @@ class PurchaseOrderVersionDetail(BaseModel):
     is_current: bool
 
 
+class PurchaseOrderDeleteRequest(BaseModel):
+    """Body accepted by DELETE /purchase-orders/{po_id}."""
+
+    deletion_reason: str
+
+
 class PurchaseOrderDetailResponse(PurchaseOrderListItem):
     contact_email: str | None = None
     contact_phone: str | None = None
@@ -70,3 +76,18 @@ class PurchaseOrderDetailResponse(PurchaseOrderListItem):
     source_file_name: str | None = None
     lines: list[PurchaseOrderLineDetail]
     versions: list[PurchaseOrderVersionDetail]
+
+
+class VersionComparisonRow(BaseModel):
+    field: str
+    a: str | None = None
+    b: str | None = None
+    status: str  # "Unchanged" | "Changed" | "Added" | "Removed"
+
+
+class VersionComparisonResponse(BaseModel):
+    po_id: int
+    po_number: str
+    version_a: int
+    version_b: int
+    rows: list[VersionComparisonRow]

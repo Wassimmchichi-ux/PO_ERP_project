@@ -84,6 +84,29 @@ def find_fgpn_by_code(db: Session, fgpn_code: str, *, project_id: int | None = N
     fgpns = db.execute(stmt).scalars().all()
 
     if not fgpns:
+        target_project_id = project_id
+        if target_project_id is None:
+            target_project_id = db.scalar(
+                select(Project.project_id).where(Project.status == "Active").limit(1)
+            )
+            if target_project_id is None:
+                target_project_id = db.scalar(select(Project.project_id).limit(1))
+
+        if target_project_id is not None:
+            now = datetime.datetime.now()
+            fgpn = FGPN(
+                project_id=target_project_id,
+                fgpn_code=fgpn_code,
+                description=f"FGPN {fgpn_code}",
+                unit_price=Decimal("0"),
+                status="Active",
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(fgpn)
+            db.flush()
+            return fgpn
+
         raise ValidationException(
             f"No FGPN found with part number '{fgpn_code}'. "
             f"The FGPN must already exist in the database before uploading a BOM.",

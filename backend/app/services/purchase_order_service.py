@@ -7,6 +7,7 @@ orders.
 """
 from __future__ import annotations
 
+import logging
 from datetime import date
 from decimal import Decimal
 
@@ -29,7 +30,11 @@ from app.schemas.purchase_order import (
     PurchaseOrderListItem,
     PurchaseOrderListResponse,
     PurchaseOrderVersionDetail,
+    VersionComparisonResponse,
+    VersionComparisonRow,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def list_purchase_orders(
@@ -127,6 +132,7 @@ def delete_purchase_order(
     db: Session,
     po_id: int,
     *,
+    deletion_reason: str,
     actor: PolicyActor | None = None,
 ) -> None:
     """Remove an unplanned test/import PO while preserving linked operations."""
@@ -180,6 +186,13 @@ def delete_purchase_order(
         .values(validated_po_id=None, status="VALIDATED")
     )
     db.delete(purchase_order)
+    logger.info(
+        "Purchase order %s (po_id=%d) deleted. Reason: %s. Actor: %s",
+        purchase_order.po_number,
+        po_id,
+        deletion_reason,
+        actor.role if actor else "system",
+    )
     db.commit()
 
 
@@ -278,3 +291,196 @@ def _to_line_detail(line: PurchaseOrderLine) -> PurchaseOrderLineDetail:
 def _latest_delivery_date(lines: list[PurchaseOrderLine]) -> date | None:
     dates = [line.delivery_date for line in lines if line.delivery_date is not None]
     return max(dates) if dates else None
+
+
+def get_po_version_pdf(
+    db: Session,
+    po_version_id: int,
+    actor: PolicyActor | None = None,
+) -> tuple[bytes, str]:
+    """Retrieve the original PDF content and filename for a PO version."""
+    policy_engine.require(actor or system_actor(), "po.view")
+
+    version = db.execute(
+        select(PurchaseOrderVersion)
+        .where(PurchaseOrderVersion.po_version_id == po_version_id)
+        .options(joinedload(PurchaseOrderVersion.document))
+    ).scalar_one_or_none()
+
+    if version is None or version.document is None:
+        raise NotFoundException(f"Purchase order version {po_version_id} not found.")
+
+    doc = version.document
+    filename = doc.file_name
+
+    from pathlib import Path
+
+    candidates = [
+        Path(doc.file_path) if doc.file_path else None,
+        Path("/app/uploads") / filename,
+        Path("backend/uploads") / filename,
+        Path("/uploads") / filename,
+        Path("ressources/business-test") / filename,
+        Path("/app/ressources/business-test") / filename,
+        Path("uploads") / filename,
+    ]
+
+    for d in [Path("/app/uploads"), Path("backend/uploads"), Path("ressources/business-test"), Path("/app/ressources/business-test")]:
+        if d.is_dir():
+            for p in d.iterdir():
+                if p.name.lower() == filename.lower():
+                    candidates.append(p)
+
+    for p in candidates:
+        if p and p.is_file():
+            try:
+                content = p.read_bytes()
+                if content:
+                    return content, filename
+            except OSError as e:
+                logger.warning("Error reading PO PDF from %s: %s", p, e)
+
+    raise NotFoundException(f"Original PDF file '{filename}' was not found on the server.")
+
+
+def compare_po_versions(
+    db: Session,
+    po_id: int,
+    v1: int,
+    v2: int,
+    actor: PolicyActor | None = None,
+) -> VersionComparisonResponse:
+    """Compare field-by-field differences between two versions of the same PO."""
+    policy_engine.require(actor or system_actor(), "po.view")
+
+    po = db.execute(
+        select(PurchaseOrder).where(PurchaseOrder.po_id == po_id)
+    ).scalar_one_or_none()
+    if po is None:
+        raise NotFoundException(f"Purchase order {po_id} not found.")
+
+    va = db.execute(
+        select(PurchaseOrderVersion)
+        .where(PurchaseOrderVersion.po_id == po_id, PurchaseOrderVersion.version_number == v1)
+        .options(
+            joinedload(PurchaseOrderVersion.document),
+            joinedload(PurchaseOrderVersion.creator),
+            selectinload(PurchaseOrderVersion.lines).joinedload(PurchaseOrderLine.fgpn),
+            selectinload(PurchaseOrderVersion.changes),
+        )
+    ).scalar_one_or_none()
+
+    vb = db.execute(
+        select(PurchaseOrderVersion)
+        .where(PurchaseOrderVersion.po_id == po_id, PurchaseOrderVersion.version_number == v2)
+        .options(
+            joinedload(PurchaseOrderVersion.document),
+            joinedload(PurchaseOrderVersion.creator),
+            selectinload(PurchaseOrderVersion.lines).joinedload(PurchaseOrderLine.fgpn),
+            selectinload(PurchaseOrderVersion.changes),
+        )
+    ).scalar_one_or_none()
+
+    if va is None:
+        raise NotFoundException(f"Version {v1} not found for PO {po.po_number}.")
+    if vb is None:
+        raise NotFoundException(f"Version {v2} not found for PO {po.po_number}.")
+
+    rows: list[VersionComparisonRow] = []
+
+    def add_header(label: str, val_a, val_b):
+        sa = str(val_a) if val_a is not None and str(val_a).strip() else None
+        sb = str(val_b) if val_b is not None and str(val_b).strip() else None
+        if sa is None and sb is None:
+            return
+        status = "Unchanged"
+        if sa is None:
+            status = "Added"
+        elif sb is None:
+            status = "Removed"
+        elif sa != sb:
+            status = "Changed"
+        rows.append(VersionComparisonRow(field=label, a=sa, b=sb, status=status))
+
+    # Header comparisons
+    add_header("Document Date", va.document_date, vb.document_date)
+    add_header("Source File", va.document.file_name if va.document else None, vb.document.file_name if vb.document else None)
+    add_header("Car Model", va.car_model, vb.car_model)
+    add_header("Engineering Phase", va.engineering_phase_level, vb.engineering_phase_level)
+    add_header("PO Level", va.po_level, vb.po_level)
+    add_header("Reason of PO", va.reason_of_purchase_order, vb.reason_of_purchase_order)
+    add_header("Change Reason", va.change_reason, vb.change_reason)
+
+    qty_a = sum(l.ordered_quantity for l in va.lines)
+    qty_b = sum(l.ordered_quantity for l in vb.lines)
+    add_header("Total Ordered Quantity", f"{qty_a:g}", f"{qty_b:g}")
+
+    amt_a = sum(l.ordered_quantity * l.unit_price for l in va.lines)
+    amt_b = sum(l.ordered_quantity * l.unit_price for l in vb.lines)
+    add_header("Total Amount (EUR)", f"{amt_a:,.2f}", f"{amt_b:,.2f}")
+
+    add_header("Total Line Count", str(len(va.lines)), str(len(vb.lines)))
+
+    # Line-by-line comparison by FGPN
+    lines_a = {l.fgpn.fgpn_code: l for l in va.lines if l.fgpn}
+    lines_b = {l.fgpn.fgpn_code: l for l in vb.lines if l.fgpn}
+    all_fgpns = sorted(set(lines_a.keys()) | set(lines_b.keys()))
+
+    for code in all_fgpns:
+        la = lines_a.get(code)
+        lb = lines_b.get(code)
+        if la is not None and lb is not None:
+            if la.ordered_quantity != lb.ordered_quantity:
+                rows.append(VersionComparisonRow(
+                    field=f"{code} — Quantity",
+                    a=f"{la.ordered_quantity:g}",
+                    b=f"{lb.ordered_quantity:g}",
+                    status="Changed",
+                ))
+            if la.unit_price != lb.unit_price:
+                rows.append(VersionComparisonRow(
+                    field=f"{code} — Unit Price",
+                    a=f"{la.unit_price:g}",
+                    b=f"{lb.unit_price:g}",
+                    status="Changed",
+                ))
+            if la.delivery_date != lb.delivery_date:
+                rows.append(VersionComparisonRow(
+                    field=f"{code} — Delivery Date",
+                    a=str(la.delivery_date) if la.delivery_date else "—",
+                    b=str(lb.delivery_date) if lb.delivery_date else "—",
+                    status="Changed",
+                ))
+            if (
+                la.ordered_quantity == lb.ordered_quantity
+                and la.unit_price == lb.unit_price
+                and la.delivery_date == lb.delivery_date
+            ):
+                rows.append(VersionComparisonRow(
+                    field=f"{code} (Qty {la.ordered_quantity:g})",
+                    a=f"{la.ordered_quantity:g} pcs",
+                    b=f"{lb.ordered_quantity:g} pcs",
+                    status="Unchanged",
+                ))
+        elif la is not None:
+            rows.append(VersionComparisonRow(
+                field=f"{code}",
+                a=f"Qty {la.ordered_quantity:g} @ {la.unit_price:g}",
+                b=None,
+                status="Removed",
+            ))
+        elif lb is not None:
+            rows.append(VersionComparisonRow(
+                field=f"{code}",
+                a=None,
+                b=f"Qty {lb.ordered_quantity:g} @ {lb.unit_price:g}",
+                status="Added",
+            ))
+
+    return VersionComparisonResponse(
+        po_id=po.po_id,
+        po_number=po.po_number,
+        version_a=v1,
+        version_b=v2,
+        rows=rows,
+    )
